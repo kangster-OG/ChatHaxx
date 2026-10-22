@@ -37,7 +37,7 @@ git merge --ff-only --quiet origin/main
 tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
 echo "latest upstream release: $tag"
 # Only the release tag: upstream moves its canary tag, which a full tag fetch refuses to clobber.
-git fetch --quiet --no-tags upstream "refs/tags/$tag:refs/tags/$tag"
+git fetch --quiet --no-tags upstream "refs/tags/${tag}:refs/tags/${tag}"
 
 if git merge-base --is-ancestor "$tag" HEAD; then
   echo "main already contains $tag"
