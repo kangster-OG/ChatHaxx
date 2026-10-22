@@ -24,5 +24,4 @@ The clone has two remotes: `origin` is this repository, and `upstream` is totec4
   release process.
 - The app's update notice still points at upstream releases. Update with the script instead of
   downloading upstream's DMG.
-- `legacy-2.1.12` keeps the earlier workspace changes (model picker, image and approval
-  visibility) from before the move to 2.1.44.
+- The earlier workspace changes from before the move to 2.1.44 are kept in a separate private repository.
