@@ -33,10 +33,11 @@ run() { local name=$1; shift; "$@" > "$LOGS/$name.log" 2>&1 || { echo "FAILED: $
 
 step "fetch"
 git fetch --quiet origin
-git fetch --quiet --tags upstream
 git merge --ff-only --quiet origin/main
 tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
 echo "latest upstream release: $tag"
+# Only the release tag: upstream moves its canary tag, which a full tag fetch refuses to clobber.
+git fetch --quiet --no-tags upstream "refs/tags/$tag:refs/tags/$tag"
 
 if git merge-base --is-ancestor "$tag" HEAD; then
   echo "main already contains $tag"
