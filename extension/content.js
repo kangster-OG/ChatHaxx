@@ -9892,6 +9892,11 @@
     if (source.state !== 'not-attempted' && source.state !== 'attempted-unresolved') return;
     if (!alive || conversationId !== forId || epoch !== forEpoch || CLF_DOM.conversationId() !== forId) return;
     const automatic = job.automatic === true;
+    // A Pro answer is never cut short for a handoff. The app files a Pro ticket only once a turn
+    // has finished, but a new question can start before the ticket reaches this page; the next
+    // activity pull after that answer lands retries from here.
+    if (automatic && CLF_DOM.generating() &&
+        proSelection(turnSelection?.turnId === turnId ? turnSelection : CLF_DOM.visibleModelSelection?.())) return;
     // An automatic ticket is the app's decision about a chat nobody is necessarily looking at,
     // and a hidden tab is a throttled one: on 2026-09-03 the source page froze solid while the
     // brief was being written in the background. Raising it first is presentation, not

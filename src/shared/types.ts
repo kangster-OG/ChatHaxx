@@ -266,7 +266,7 @@ export interface CompactionSettings {
   autoTokens: number;
   /** Editable content instructions for the brief; protocol/recovery framing stays code-owned. */
   handoffPrompt: string;
-  /** How long the brief should be; absent means 'thorough', the shipped 10k–30k rules. */
+  /** How long the brief should be; absent means 'standard', 4k–10k tokens. */
   handoffLength?: 'thorough' | 'standard' | 'short';
 }
 

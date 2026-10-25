@@ -133,6 +133,7 @@ import { APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT } from '../shared/appro
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
+  automaticCompactionWaitsForTurnEnd,
   conversationWasSuperseded,
   findSessionByConversation,
   getSession,
@@ -2246,8 +2247,12 @@ async function fileCompactionTicket(sessionId: string, id: string, automatic = f
   if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
   if (goalWorkerChat(id)) throw new Error('worker_compaction_disabled');
   if (isChatBlocked(id)) throw new Error('chat_blocked');
-  if (automatic && !automaticCompactionAllowed(await getSession(sessionId))) throw new Error('automatic_compaction_disabled');
+  const summary = automatic ? await getSession(sessionId) : null;
+  if (automatic && !automaticCompactionAllowed(summary)) throw new Error('automatic_compaction_disabled');
   const existing = continuationForSession(sessionId);
+  // A new automatic ticket for a Pro chat is filed between its turns, never during one.
+  if (automatic && !existing && automaticCompactionWaitsForTurnEnd(summary) &&
+      liveConversations().some(row => row.conversationId === id && row.activeTurnId)) throw new Error('automatic_compaction_waits_for_turn_end');
   const opened = existing ?? await openContinuationNow(sessionId, id, automatic);
   rememberToken(sessionId, opened.token);
   changed();
@@ -5429,6 +5434,7 @@ export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
   await fileSilenceTickets(silent.spent, now);
   // All undelivered tickets share this pass, including Continue filed by the silence pass.
   const goalsQueued = await inspectOwedPickups(now);
+  await fileTurnBoundaryCompactions(now);
   const compactionsQueued = await inspectOwedCompactions(now);
 
   const silenceChanged = silent.queued || silent.spent.length > 0 || goalsQueued || compactionsQueued;
@@ -7346,7 +7352,13 @@ async function failedCompactionTurnCurrent(conversationId: string, sessionId: st
   return !!after && after.conversationId === conversationId && !after.activeTurnId && after.events === before.events;
 }
 
-async function considerAutomaticCompaction(conversationId: string, sessionId: string, failedTurn?: string): Promise<void> {
+async function considerAutomaticCompaction(
+  conversationId: string,
+  sessionId: string,
+  failedTurn?: string,
+  /** The completed turn a Pro chat is being compacted after; see fileTurnBoundaryCompactions. */
+  endedTurn?: string
+): Promise<void> {
   if (!getConfig().compaction.auto || compactionFilings.has(conversationId)) return;
   if (goalFencedChat(conversationId) || continuationForSession(sessionId) || stopRequestedFor(conversationId)) return;
   // Exact tool attribution already owns this grant and consumes it on final/Stop.
@@ -7358,29 +7370,68 @@ async function considerAutomaticCompaction(conversationId: string, sessionId: st
     return liveTurnIsCurrent(conversationId, now) || Boolean(grant?.sessionId === sessionId && grant.mcpBacked &&
       !grant.thinkingFailed && grant.evidenceAt <= now && grant.until > now);
   };
-  if (!failedTurn && !hasCurrentWork()) return;
+  // A turn boundary is the opposite of current work: nothing may be running, so nothing is stopped.
+  const turnIdle = (): boolean => !liveConversations().some(row => row.conversationId === conversationId && row.activeTurnId);
+  const eligible = (): boolean => endedTurn ? turnIdle() : failedTurn ? true : hasCurrentWork();
+  // A refusal of an earlier turn does not cover the turn that just finished.
+  const working = (summary: SessionSummary): boolean =>
+    endedTurn ? summary.autoCompactionRefusal?.turnId !== endedTurn : hasCurrentWork();
+  if (!eligible()) return;
   compactionFilings.add(conversationId);
   try {
     const summary = await getSession(sessionId).catch(() => null);
-    if (!summary || summary.conversationId !== conversationId || summary.endedAt !== null || summary.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(summary, hasCurrentWork())) return;
+    if (!summary || summary.conversationId !== conversationId || summary.endedAt !== null || summary.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(summary, working(summary))) return;
+    // A Pro answer is never stopped for a handoff, not even one whose stream broke: ChatGPT may
+    // still be finishing it. It compacts after a turn that completed.
+    if (automaticCompactionWaitsForTurnEnd(summary) ? !endedTurn : Boolean(endedTurn)) return;
     if (await conversationWasSuperseded(conversationId)) return;
     if (failedTurn && !await failedCompactionTurnCurrent(conversationId, sessionId, failedTurn)) return;
     // Re-read after the awaits: the turn may have ended, or a page may have filed by hand.
     const current = await getSession(sessionId);
-    if (!current || current.conversationId !== conversationId || current.endedAt !== null || current.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(current, hasCurrentWork())) return;
+    if (!current || current.conversationId !== conversationId || current.endedAt !== null || current.browserRecoveryDismissedAt !== undefined || !autoCompactionReady(current, working(current))) return;
     if (failedTurn && !await failedCompactionTurnCurrent(conversationId, sessionId, failedTurn)) return;
-    if ((!failedTurn && !hasCurrentWork()) || continuationForSession(sessionId) || goalFencedChat(conversationId) ||
+    if (!eligible() || continuationForSession(sessionId) || goalFencedChat(conversationId) ||
         stopRequestedFor(conversationId) || !getConfig().compaction.auto || !automaticCompactionAllowed(current)) return;
     const opened = await openContinuationNow(sessionId, conversationId, true);
     rememberToken(sessionId, opened.token);
     changed();
     logInfo(
-      `bridge: ${conversationId} ${failedTurn ? 'lost its current turn' : 'is working'} at ${current.contextTokens} context tokens — filed auto-compaction ticket ${opened.token.slice(0, 8)}`
+      `bridge: ${conversationId} ${failedTurn ? 'lost its current turn' : endedTurn ? 'finished a Pro turn' : 'is working'} at ${current.contextTokens} context tokens — filed auto-compaction ticket ${opened.token.slice(0, 8)}`
     );
   } catch (err) {
     logWarn(`bridge: could not file the auto-compaction ticket for ${conversationId} — ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     compactionFilings.delete(conversationId);
+  }
+}
+
+/** How recent a completed Pro turn must be to compact after it; older chats were only opened. */
+const TURN_BOUNDARY_WINDOW_MS = 30 * 60_000;
+/** The last completed turn each chat was considered after, so one turn is considered once. */
+const turnBoundaryConsidered = new Map<string, string>();
+
+/**
+ * Compacts Pro chats between turns.
+ *
+ * The ordinary trigger rides on a chat's current work and stops that work, which a Pro chat is
+ * spared. This one runs on the sweep instead and files only for a chat whose newest turn
+ * completed recently, has no turn running now and is over the threshold. A stale chat over the
+ * line that is merely opened keeps quiet, as it does for every other model.
+ */
+async function fileTurnBoundaryCompactions(now: number): Promise<void> {
+  const config = getConfig().compaction;
+  if (!config.auto || config.autoTokens <= 0) return;
+  for (const row of liveConversations()) {
+    if (row.activeTurnId || row.lastTurnOutcome !== 'completed' || compactionFilings.has(row.conversationId) ||
+        continuationForSession(row.sessionId)) continue;
+    const summary = await getSession(row.sessionId).catch(() => null);
+    if (!summary || summary.conversationId !== row.conversationId || summary.contextTokens < config.autoTokens ||
+        !automaticCompactionWaitsForTurnEnd(summary)) continue;
+    const [last] = await readRecentEvents(row.sessionId, 1, { kinds: ['turn_start', 'turn_end'] }).catch(() => []);
+    if (last?.kind !== 'turn_end' || last.outcome !== 'completed' || !last.turnId ||
+        now - last.time > TURN_BOUNDARY_WINDOW_MS || turnBoundaryConsidered.get(row.conversationId) === last.turnId) continue;
+    turnBoundaryConsidered.set(row.conversationId, last.turnId);
+    await considerAutomaticCompaction(row.conversationId, row.sessionId, undefined, last.turnId);
   }
 }
 
@@ -9424,6 +9475,13 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
     // a prime's handoff sat at Preparing that long after "resume HTTP 404". A running tool still waits.
     const silent = runningToolProgress(entry.from) === null &&
       (watch.streamLost === true || (grant?.sessionId === entry.sessionId && grant.until + schedule.every <= now));
+    // A Pro chat's automatic ticket waits out a running answer however long it is silent: the page
+    // would stop it, and a pickup would only reload it.
+    if (phase === 'asking' && entry.automatic && automaticCompactionWaitsForTurnEnd(session) &&
+        liveConversations().some(row => row.conversationId === entry.from && row.activeTurnId)) {
+      watch.nextAt = now + schedule.every;
+      continue;
+    }
     if (phase === 'asking' && session && !silent && sessionInputActivity(session).exact) {
       watch.nextAt = now + schedule.every;
       continue;

@@ -3028,7 +3028,7 @@ describe('automatic compaction', () => {
     }
   });
 
-  it('observes Astra per chat, refuses automatic tickets, and preserves manual compaction', async () => {
+  it('never files an automatic ticket during a Pro turn, and preserves manual compaction', async () => {
     await pair();
     const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac90';
     await withThreshold(10_000, async () => {
@@ -3038,7 +3038,7 @@ describe('automatic compaction', () => {
       ] } });
       await settled();
       const activity = await request('GET', `/activity?conversationId=${conversationId}`);
-      expect(activity.body.context.auto).toBe(false);
+      expect(activity.body.context.auto).toBe(true);
       expect(continuationForSession(activity.body.sessionId)).toBeNull();
       const automatic = await request('POST', '/compact', { body: { conversationId, ticket: true, automatic: true } });
       expect(automatic.status).not.toBe(202);
@@ -3049,25 +3049,24 @@ describe('automatic compaction', () => {
     });
   });
 
-  it('withdraws an already filed automatic ticket before its send after selecting Astra', async () => {
+  it('compacts an oversized Pro chat after its turn completes', async () => {
     await pair();
     const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac91';
     await withThreshold(10_000, async () => {
       await request('POST', '/events', { body: { conversationId, events: [
-        { kind: 'turn_start', time: Date.now(), turnId: 'before-astra' }, ...over()
+        { kind: 'model_selection', model: 'gpt-6', reasoningEffort: 'pro', time: Date.now() },
+        { kind: 'turn_start', time: Date.now(), turnId: 'pro-turn' }, ...over()
       ] } });
-      const activity = await request('GET', `/activity?conversationId=${conversationId}`);
-      // Ticket persistence runs after event ingestion; wait for that fact rather
-      // than assuming the hosted runner commits it within a 25 ms sleep.
-      await vi.waitFor(() => expect(continuationForSession(activity.body.sessionId)).toMatchObject({ automatic: true }), { timeout: 3000 });
-      const ticket = continuationForSession(activity.body.sessionId)!;
+      await settled();
+      const sessionId = (await request('GET', `/activity?conversationId=${conversationId}`)).body.sessionId as string;
+      await sweepStaleSwarm(Date.now());
+      expect(continuationForSession(sessionId)).toBeNull();
       await request('POST', '/events', { body: { conversationId, events: [
-        { kind: 'model_selection', model: 'gpt-6', reasoningEffort: 'pro', time: Date.now() }
+        { kind: 'turn_end', time: Date.now(), turnId: 'pro-turn', outcome: 'completed' }
       ] } });
-      const send = await request('POST', '/compact', { body: { conversationId, token: ticket.token, sourceAttempt: true } });
-      expect(send.status).toBe(409);
-      expect(send.body.error).toBe('automatic_compaction_disabled');
-      expect(continuationForSession(activity.body.sessionId)).toBeNull();
+      await settled();
+      await sweepStaleSwarm(Date.now());
+      await vi.waitFor(() => expect(continuationForSession(sessionId)).toMatchObject({ automatic: true }), { timeout: 3000 });
     });
   });
 

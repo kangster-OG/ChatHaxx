@@ -95,7 +95,11 @@ export const browserBridgePortSchema = z.union([z.literal('auto'), z.literal(BRO
  * All of it remains a setting, because the real ceiling moves with the account, the model
  * and the size of what is attached.
  */
-const DEFAULT_CONTEXT_WINDOW = 400_000;
+//
+// 280k since ChatHaxx's compaction tuning (2026-10-25). Chats were measured dying between
+// roughly 300k and 350k, so a trigger at 400k fired after the chat it was meant to save had
+// already stopped answering, and a brief written that late came back with a degraded tail.
+const DEFAULT_CONTEXT_WINDOW = 280_000;
 /** Only the sizes Settings offers; anything else in a hand-edited file falls back to the default. */
 const recordingStorageLimit = z.number()
   .refine(size => (RECORDING_STORAGE_LIMITS_GIB as readonly number[]).includes(size))
@@ -122,7 +126,8 @@ const DEFAULT_SESSIONS: SessionSettings = {
  */
 const OLD_TOKEN_DEFAULTS = [
   { advisoryTokens: 180_000, limitTokens: 200_000 },
-  { advisoryTokens: 300_000, limitTokens: 400_000 }
+  { advisoryTokens: 300_000, limitTokens: 400_000 },
+  { advisoryTokens: 400_000, limitTokens: 533_333 }
 ];
 const DEFAULT_COMPACTION: CompactionSettings = {
   // On, at the advisory line.
@@ -815,14 +820,14 @@ function adoptAutoCompaction(config: Config): Config {
  *
  * They move. A threshold that is any other number was typed by somebody and stays.
  *
- * There is no matching migration downward: 400k is what this now defaults to, so a config
- * that already holds it, whether from 1.7 or from a person, simply keeps it.
+ * The 400k default moves down the same way to 280k: it was what the app wrote for itself, and
+ * it fired after the chats it was meant to save had stopped answering.
  */
-const SUPERSEDED_AUTO_DEFAULTS = { auto: true, autoTokens: 300_000 };
+const SUPERSEDED_AUTO_TOKENS = [300_000, 400_000];
 
 function adoptWiderWindow(config: Config): Config {
   const { auto, autoTokens } = config.compaction;
-  if (auto !== SUPERSEDED_AUTO_DEFAULTS.auto || autoTokens !== SUPERSEDED_AUTO_DEFAULTS.autoTokens) return config;
+  if (auto !== true || !SUPERSEDED_AUTO_TOKENS.includes(autoTokens) || autoTokens === DEFAULT_COMPACTION.autoTokens) return config;
   return {
     ...config,
     compaction: { ...config.compaction, autoTokens: DEFAULT_COMPACTION.autoTokens }

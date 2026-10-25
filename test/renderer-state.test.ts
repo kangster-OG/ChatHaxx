@@ -3869,10 +3869,10 @@ it('saves the Continue prompt from its editor, and Restore default sends the bui
   expect(prompt.value).toBe('');
 });
 
-it('offers the handoff length, starting at the thorough default, and saves a shorter choice', async () => {
+it('offers the handoff length, starting at the standard default, and saves a shorter choice', async () => {
   const mounted = await mountChat({ hasGoalKey: true });
   const length = mounted.window.document.getElementById('handoffLength') as HTMLSelectElement;
-  expect(length.value).toBe('thorough');
+  expect(length.value).toBe('standard');
   expect([...length.options].map(option => option.value)).toEqual(['thorough', 'standard', 'short']);
   length.value = 'short';
   length.dispatchEvent(new mounted.window.Event('change'));

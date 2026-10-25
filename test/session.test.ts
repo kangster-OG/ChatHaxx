@@ -32,6 +32,7 @@ import {
 import {
   appendEvent,
   autoCompactionReady,
+  automaticCompactionWaitsForTurnEnd,
   observeSessionModel,
   recordWorkerAssignment,
   createSession,
@@ -2074,7 +2075,7 @@ describe('session store', () => {
     expect(await readAsset(summary.id, '../../../config.json')).toBeNull();
   });
 
-  it('keeps the compaction exemption model-scoped even with Infinite Astra enabled', async () => {
+  it('compacts Pro chats only at a turn boundary, model-scoped even with Infinite Astra enabled', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
     try {
@@ -2083,30 +2084,36 @@ describe('session store', () => {
         time: Date.now(), source: 'extension', kind: 'user_message', messageId: 'astra-u',
         message: { text: 'x'.repeat(44_000), chars: 44_000, truncated: false }
       });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      // Pro chats compact too; the selection only decides whether they wait for their turn to end.
+      const turnBoundaryOnly = async (): Promise<boolean> => {
+        const current = await getSession(summary.id);
+        expect(autoCompactionReady(current)).toBe(true);
+        return automaticCompactionWaitsForTurnEnd(current);
+      };
+      expect(await turnBoundaryOnly()).toBe(false);
       await observeSessionModel(summary.id, 'conv-astra', 'GPT-6 Pro', 200);
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await turnBoundaryOnly()).toBe(true);
       // A delayed old receipt and a foreign document are neither the current selection.
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-6-sol', 100);
       await observeSessionModel(summary.id, 'other-chat', 'gpt-6-sol', 300);
       await flushSessions();
       resetSessionStoreForTests();
       expect((await getSession(summary.id))?.selectedModel?.model).toBe('GPT-6 Pro');
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await turnBoundaryOnly()).toBe(true);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-5.6-sol', 400);
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      expect(await turnBoundaryOnly()).toBe(false);
       await saveConfig({ ...base, ui: { ...base.ui, finishTool: true }, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      expect(await turnBoundaryOnly()).toBe(false);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-6-astra', 500);
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await turnBoundaryOnly()).toBe(true);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-5.6-pro', 510);
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await turnBoundaryOnly()).toBe(true);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-5.6-sol', 520, 'pro');
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await turnBoundaryOnly()).toBe(true);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-6', 530, 'pro');
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await turnBoundaryOnly()).toBe(true);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-5.6-sol', 600);
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      expect(await turnBoundaryOnly()).toBe(false);
     } finally { await saveConfig(base); }
   });
 
@@ -2450,8 +2457,8 @@ describe('handoff storage', () => {
     expect(chunkText('short brief', 1000)).toEqual(['short brief']);
   });
 
-  it('asks for user-authoritative handoffs up to the documented 30k-token ceiling', () => {
-    const prompt = nativeHandoffPrompt();
+  it('asks for user-authoritative handoffs up to the documented 30k-token ceiling when set to thorough', () => {
+    const prompt = nativeHandoffPrompt('', true, DEFAULT_HANDOFF_PROMPT, 'thorough');
     expect(prompt).toContain(DEFAULT_HANDOFF_PROMPT);
     expect(prompt).toMatch(/user's messages as the highest-authority source/i);
     expect(prompt).toMatch(/10,000[–-]30,000 tokens/i);
@@ -2477,7 +2484,9 @@ describe('handoff storage', () => {
   });
 
   it('keeps the thorough default byte for byte and swaps only the length for a shorter brief (#995)', () => {
-    expect(nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'thorough')).toBe(nativeHandoffPrompt('token', true));
+    expect(nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'thorough')).toContain(DEFAULT_HANDOFF_PROMPT);
+    // Standard is the default length.
+    expect(nativeHandoffPrompt('token', true)).toBe(nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'standard'));
     const short = nativeHandoffPrompt('token', true, DEFAULT_HANDOFF_PROMPT, 'short');
     expect(short).not.toMatch(/10,000[–-]30,000|10k[–-]30k|~6,000-token brief is normally too short|Never exceed 30,000/i);
     expect(short).toMatch(/target roughly 2,000–6,000 tokens/);

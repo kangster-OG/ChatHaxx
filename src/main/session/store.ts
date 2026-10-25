@@ -1188,12 +1188,24 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
  * once a stopped/settled chat asks for its handoff prompt; pre-barrier refusal owns no durable
  * state and may be attempted by a later generation.
  */
-export function automaticCompactionAllowed(summary?: SessionSummary | null): boolean {
-  const config = getConfig();
+export function automaticCompactionAllowed(_summary?: SessionSummary | null): boolean {
+  return getConfig().compaction.auto;
+}
+
+/**
+ * Whether automatic compaction must wait for this chat's turn to finish instead of stopping it.
+ *
+ * Automatic compaction is filed while a chat works and stops the running turn before asking for
+ * the handoff. That is cheap on an ordinary answer and expensive on a Pro one, which can think for
+ * twenty minutes. Pro chats used to be exempt from automatic compaction altogether, so they grew
+ * past their window and died there. They now compact at the turn boundary: filed only after a
+ * turn completed, never while one runs. The selected model owns this; Infinite Astra with Sol
+ * still compacts the ordinary way.
+ */
+export function automaticCompactionWaitsForTurnEnd(summary?: SessionSummary | null): boolean {
   const selected = summary?.selectedModel;
-  // The selected model owns this exemption; Infinite Astra with Sol still compacts.
-  return config.compaction.auto &&
-    !(selected?.conversationId === summary?.conversationId && isProModel(selected?.model, selected?.reasoningEffort));
+  return Boolean(selected && selected.conversationId === summary?.conversationId &&
+    isProModel(selected.model, selected.reasoningEffort));
 }
 
 export function autoCompactionReady(

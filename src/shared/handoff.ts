@@ -23,31 +23,33 @@ export const DEFAULT_HANDOFF_PROMPT = `Rules:
 - Spend extra space on concrete continuation value: exact changed files and symbols, dirty-tree caveats, test/build commands and outcomes, live-session evidence, current hypotheses with confidence, rejected approaches and why, pending worker ownership, release/install state, and the precise next actions. Do not spend that space repeating prose or narrating obvious chronology.
 - Be dense and operational even when long. No preamble, no praise, no restating these instructions, no "in this session we". Use compact sections, bullets and short lines so a 10k–30k-token brief remains navigable rather than repetitive.
 - If the recording is incomplete or ambiguous, say so in one line rather than inventing detail.
+- Write the brief in order of importance so its beginning is always usable on its own: the sections below are already in that order. Put long file lists and verification detail last. Use normal prose with normal spacing. If earlier parts of this conversation are no longer clear to you, say so in one line instead of reconstructing them. Stop when the content is complete; never pad toward a length target.
 
-Structure the brief with these headings, omitting any that would be empty:
+Structure the brief with these headings, in this order, omitting any that would be empty:
 
 TASK — the original goal, in the user's terms.
 USER SPECIFICATION — every material user request, constraint, preference, correction and changed decision, with the final position explicit. This is the authoritative section.
 CURRENT STATE — what is true right now: repository/app/session state, active implementation, versions, processes, and latest relevant observed behaviour.
-DONE — completed and verified, with the evidence.
-IN PROGRESS — started, not finished, and exactly where it stopped.
-PLANNED / DECIDED — concrete work the user or agent decided should happen next but that tool evidence does not show as completed yet.
-FAILED / UNRESOLVED — what broke, the error, what was already tried.
-FILES — paths touched or inspected that matter to continuation, what changed in each, and important symbols/line regions when known.
-VERIFICATION — tests, builds, smoke checks and live evidence already run, with exact commands/results and what remains unverified.
-ENVIRONMENT — commands, versions, running processes, repo/dirty-tree state, installation/release state, and anything the next agent must preserve.
 NEXT — the concrete next actions, in order.
-DO NOT — what the next agent should not redo or undo.`;
+DO NOT — what the next agent should not redo or undo.
+IN PROGRESS — started, not finished, and exactly where it stopped.
+FAILED / UNRESOLVED — what broke, the error, what was already tried.
+DONE — completed and verified, with the evidence.
+PLANNED / DECIDED — concrete work the user or agent decided should happen next but that tool evidence does not show as completed yet.
+ENVIRONMENT — commands, versions, running processes, repo/dirty-tree state, installation/release state, and anything the next agent must preserve.
+VERIFICATION — tests, builds, smoke checks and live evidence already run, with exact commands/results and what remains unverified.
+FILES — paths touched or inspected that matter to continuation, what changed in each, and important symbols/line regions when known.`;
 
 
 /**
- * How long a Compact & Resume brief should be (#995). Thorough is the shipped prompt unchanged.
+ * How long a Compact & Resume brief should be (#995). Thorough is the shipped prompt unchanged;
+ * standard is the default, because a brief written near the end of a long window degrades in its tail.
  * The shorter choices swap the default prompt's two length sentences and add one code-owned line
  * that overrides any other target, so they also apply to an edited prompt.
  */
 export const HANDOFF_LENGTHS = ['thorough', 'standard', 'short'] as const;
 export type HandoffLength = (typeof HANDOFF_LENGTHS)[number];
-export const DEFAULT_HANDOFF_LENGTH: HandoffLength = 'thorough';
+export const DEFAULT_HANDOFF_LENGTH: HandoffLength = 'standard';
 
 const DEFAULT_LENGTH_RULE = DEFAULT_HANDOFF_PROMPT.split('\n').find(line => line.startsWith('- Treat the brief as a lossless operational compression'))!;
 const DEFAULT_NAVIGABLE = 'so a 10k–30k-token brief remains navigable';

@@ -406,7 +406,7 @@ describe('settings migration', () => {
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(true);
     expect(loaded.compaction.autoTokens).toBe(loaded.sessions.advisoryTokens);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.autoTokens).toBe(280_000);
     expect(loaded.compaction.handoffPrompt).toMatch(/10,000[–-]30,000 tokens/i);
   });
 
@@ -459,16 +459,16 @@ describe('settings migration', () => {
     expect((await loadConfig()).ui.enterSends).toBe(false);
   });
 
-  it('keeps the thorough handoff length for older and broken configs, and saves a choice', async () => {
+  it('uses the standard handoff length for older and broken configs, and saves a choice', async () => {
     const config = defaultConfig();
-    expect(config.compaction.handoffLength).toBe('thorough');
+    expect(config.compaction.handoffLength).toBe('standard');
     const older = structuredClone(config) as Record<string, any>;
     delete older.compaction.handoffLength;
     await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(older), 'utf8');
-    expect((await loadConfig()).compaction.handoffLength).toBe('thorough');
+    expect((await loadConfig()).compaction.handoffLength).toBe('standard');
     await fs.writeFile(path.join(dir, 'config.json'),
       JSON.stringify({ ...config, compaction: { ...config.compaction, handoffLength: 'tiny' } }), 'utf8');
-    expect((await loadConfig()).compaction.handoffLength).toBe('thorough');
+    expect((await loadConfig()).compaction.handoffLength).toBe('standard');
     await saveConfig({ ...config, compaction: { ...config.compaction, handoffLength: 'short' } });
     expect((await loadConfig()).compaction.handoffLength).toBe('short');
   });
@@ -496,7 +496,7 @@ describe('settings migration', () => {
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: false, autoTokens: 300_000 } });
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.autoTokens).toBe(280_000);
   });
 
   /**
@@ -510,15 +510,16 @@ describe('settings migration', () => {
     const config = defaultConfig();
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 300_000 } });
     const loaded = await loadConfig();
-    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 400_000 });
+    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 280_000 });
   });
 
-  /** And nothing moves back down: 400k is the default now, however a config came to hold it. */
-  it('leaves a config already at the wider window alone', async () => {
+  /** The 400k default fired after chats had already died, so it moves down to 280k; a typed number stays. */
+  it('moves the untouched 400k default down to 280k and leaves a chosen threshold', async () => {
     const config = defaultConfig();
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 400_000 } });
-    const loaded = await loadConfig();
-    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 400_000 });
+    expect((await loadConfig()).compaction).toMatchObject({ auto: true, autoTokens: 280_000 });
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 350_000 } });
+    expect((await loadConfig()).compaction).toMatchObject({ auto: true, autoTokens: 350_000 });
   });
 
   /**
@@ -529,8 +530,11 @@ describe('settings migration', () => {
     const config = defaultConfig();
     await saveConfig({ ...config, sessions: { ...config.sessions, advisoryTokens: 300_000, limitTokens: 400_000 } });
     const moved = await loadConfig();
-    expect(moved.sessions.advisoryTokens).toBe(400_000);
-    expect(moved.sessions.limitTokens).toBe(Math.round((400_000 * 4) / 3));
+    expect(moved.sessions.advisoryTokens).toBe(280_000);
+    expect(moved.sessions.limitTokens).toBe(Math.round((280_000 * 4) / 3));
+
+    await saveConfig({ ...config, sessions: { ...config.sessions, advisoryTokens: 400_000, limitTokens: 533_333 } });
+    expect((await loadConfig()).sessions).toMatchObject({ advisoryTokens: 280_000, limitTokens: Math.round((280_000 * 4) / 3) });
 
     await saveConfig({ ...config, sessions: { ...config.sessions, advisoryTokens: 300_000, limitTokens: 350_000 } });
     const kept = await loadConfig();
@@ -581,7 +585,7 @@ describe('settings migration', () => {
     await saveConfig(older as ReturnType<typeof defaultConfig>);
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.autoTokens).toBe(280_000);
   });
 
   it('serializes concurrent read-modify-write changes instead of losing one', async () => {
