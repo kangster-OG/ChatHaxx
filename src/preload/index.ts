@@ -29,7 +29,7 @@ import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '..
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AppState, Capabilities, CompanionDiagnostics, Config, Diagnosis, LogEntry } from '../shared/types.js';
+import type { AppState, Capabilities, CompanionDiagnostics, Config, Diagnosis, LogEntry, SettingsBackupChoice } from '../shared/types.js';
 import type {
   Handoff,
   ImageStorageClearMode,
@@ -159,6 +159,15 @@ const api = {
   setMainTexts: (texts: Record<string, string>) => call<void>('ui:mainTexts', texts),
   /** The interface language, kept by the app for the browser extension. */
   setUiLanguage: (language: string) => call<void>('ui:language', language),
+  /** Settings backup. Saved keys go in only with a passphrase, and never come back to the page. */
+  exportSettings: (includeKeys: boolean, passphrase?: string) =>
+    call<{ file: string; keyCount: number } | null>('settings:export', { includeKeys, ...(passphrase !== undefined ? { passphrase } : {}) }),
+  pickSettingsBackup: () => call<SettingsBackupChoice | null>('settings:importPick', undefined),
+  importSettingsBackup: (token: string, includeKeys: boolean, passphrase?: string) =>
+    // `warnings`: what went wrong after the settings were written, each a sentence of its own.
+    call<{ state: AppState; changedCount: number; keyCount: number; warnings?: string[] }>('settings:importApply', { token, includeKeys, ...(passphrase !== undefined ? { passphrase } : {}) }),
+  testPhonePush: () => call<void>('phonePush:test', undefined),
+  setPhonePushToken: (token: string) => call<AppState>('phonePush:token', { token }),
   markWhatsNewSeen: () => call<void>('ui:whatsNewSeen'),
   /** The one-time automatic plugin refresh offer: true turns it on; either answer is kept. */
   answerPluginRefreshOffer: (turnOn: boolean) => call<AppState>('pluginRefresh:offer', { turnOn }),
@@ -265,7 +274,7 @@ const api = {
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
   // A code block's Save: main asks where, in a native dialog, and `name` is only its suggestion.
   saveCode: (request: { text: string; name: string }) => call<{ done: 'saved'; name: string } | { done: 'cancelled' }>('code:save', request),
-  exportMarkdown: (request: { id: string; scope: 'answer' | 'latest' | 'session'; turnId?: string; messageId?: string; target: 'clipboard' | 'file' }) =>
+  exportMarkdown: (request: { id: string; scope: 'answer' | 'latest' | 'session'; turnId?: string; messageId?: string; target: 'clipboard' | 'file'; format?: 'markdown' | 'html' }) =>
     call<{ done: 'copied' } | { done: 'saved'; name: string } | { done: 'cancelled' }>('sessions:exportMarkdown', request),
   // `external`: the system's own browser even for a page the CoS browser would open.
   openLink: (url: string, options: { external?: boolean } = {}) => call<boolean>('link:open', { url, ...(options.external ? { external: true } : {}) }),
@@ -293,6 +302,7 @@ const api = {
   retryChatgptProject: (id: string) => call<LocalProject | null>('projects:chatgpt-retry', { id }),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
   setProjectColor: (id: string, color: ProjectColor | null) => call<LocalProject>('projects:color', { id, color }),
+  setProjectSecretsShieldOff: (id: string, off: boolean) => call<LocalProject>('projects:secrets-shield', { id, off }),
   listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
   watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
   onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {
