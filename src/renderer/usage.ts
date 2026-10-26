@@ -1,6 +1,6 @@
 import { currentLanguage, ui, t, tn } from './i18n.js';
 import { $, el, run, toast } from './dom.js';
-import { DEFAULT_USAGE_FORMULA, usageDateKey as dateKey, usageEstimate, usageMessageTotals, usageModelGroups, usageRate, usageWeekStart, type UsageFormula, type UsageOverview } from '../shared/usage.js';
+import { DEFAULT_USAGE_FORMULA, LONG_CONTEXT_TOKENS, usageDateKey as dateKey, usageEstimate, usageMessageTotals, usageModelGroups, usageRate, usageWeekStart, validUsageRate, type UsageFormula, type UsageOverview, type UsageRate } from '../shared/usage.js';
 import type { ProviderUsage } from '../shared/provider-usage.js';
 let snapshot: UsageOverview | null = null;
 let projectNames = new Map<string, string>();
@@ -9,7 +9,8 @@ let projectNames = new Map<string, string>();
 let projectNameCells: Array<[HTMLElement, () => string]> = [];
 let otherAppsGeneration = 0;
 let loadGeneration = 0;
-const FORMULA_KEY = 'usage-formula-v1';
+// v2 holds input, cached-input and output rates; v1's cached-input-only numbers are not reused.
+const FORMULA_KEY = 'usage-formula-v2';
 const WEEK_START_KEY = 'cos.usage.weekStart';
 let weekStart = 1;
 let formula: UsageFormula = { ...DEFAULT_USAGE_FORMULA, rates: { ...DEFAULT_USAGE_FORMULA.rates } };
@@ -124,16 +125,29 @@ function paintRates(): void {
   const host = $('usageRates'); host.replaceChildren();
   for (const model of [...new Set(snapshot.models.map(row => row.model))].sort()) {
     const label = el('label', 'setting'); const text = el('span', 'setting-text');
-    text.append(el('b', '', model), el('em', '', () => usageRate(model, DEFAULT_USAGE_FORMULA) !== undefined ? t("USD / 1M cached input · editable official baseline, checked 27 September 2026") : t("USD / 1M cached input · enter a verified comparison rate")));
-    const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '0.01'; ui(input, 'placeholder', () => t("Unknown rate")); input.value = usageRate(model, formula)?.toString() ?? '';
-    ui(input, 'aria-label', () => t("{0} cached-input USD per million tokens", [model]));
-    input.addEventListener('input', () => {
-      if (input.value === '') formula.rates[model] = null;
-      else if (input.validity.valid && Number.isFinite(input.valueAsNumber)) formula.rates[model] = input.valueAsNumber;
-      else return;
+    text.append(el('b', '', model), el('em', '', () => usageRate(model, DEFAULT_USAGE_FORMULA) !== undefined ? t("USD per 1M tokens: input · cached input · output. Official price, checked 26 October 2026") : t("USD per 1M tokens: input · cached input · output. Enter a verified rate")));
+    const fields = el('span', 'usage-rate-fields');
+    const labels: Record<keyof UsageRate, () => string> = {
+      input: () => t("{0} input USD per million tokens", [model]),
+      cached: () => t("{0} cached-input USD per million tokens", [model]),
+      output: () => t("{0} output USD per million tokens", [model])
+    };
+    const inputs = (['input', 'cached', 'output'] as const).map(part => {
+      const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '0.01'; input.dataset.ratePart = part;
+      ui(input, 'placeholder', () => t("Unknown rate")); ui(input, 'aria-label', labels[part]);
+      const rate = usageRate(model, formula); input.value = validUsageRate(rate) ? String(rate[part]) : '';
+      return input;
+    });
+    // A rate is all three parts or none: an empty field clears the model's rate.
+    for (const input of inputs) input.addEventListener('input', () => {
+      if (inputs.some(field => field.value === '')) formula.rates[model] = null;
+      else if (inputs.every(field => field.validity.valid && Number.isFinite(field.valueAsNumber))) {
+        formula.rates[model] = { input: inputs[0]!.valueAsNumber, cached: inputs[1]!.valueAsNumber, output: inputs[2]!.valueAsNumber };
+      } else return;
       saveFormula(); paintCost();
     });
-    label.append(text, input); host.append(label);
+    fields.append(...inputs);
+    label.append(text, fields); host.append(label);
   }
 }
 /** A recorded day key (YYYY-MM-DD) as a short local date, e.g. "Sun, Sep 27". */
@@ -151,7 +165,7 @@ function paintCost(): void {
   const costSummary = document.getElementById('usageTotalCost');
   if (costSummary) {
     ui(costSummary.querySelector('strong')!, 'textContent', () => costText(total));
-    ui(costSummary, 'data-usage-hint', () => t('{0} estimated tokens; {1} have no comparison rate. Cached-input equivalent, not a bill.', [Math.round(total.tokens).toLocaleString(currentLanguage()), Math.round(total.unpricedTokens).toLocaleString(currentLanguage())]));
+    ui(costSummary, 'data-usage-hint', () => t('{0} estimated tokens; {1} have no comparison rate. API-price equivalent, not a bill.', [Math.round(total.tokens).toLocaleString(currentLanguage()), Math.round(total.unpricedTokens).toLocaleString(currentLanguage())]));
   }
   const daily = snapshot.days.map(day => ({ ...day, ...usageEstimate(day.models, formula) }));
   for (const [label, number] of [['Processed tokens · est.', total.tokens], ['Peak daily tokens', Math.max(0, ...daily.map(day => day.tokens))]] as const) {
@@ -208,8 +222,8 @@ function paintCost(): void {
   heat.append(grid, legend);
   // The newest weeks are the ones worth seeing; a narrow window scrolls the year sideways.
   setTimeout(() => { const box = heat.parentElement; if (box && box.scrollWidth > box.clientWidth) box.scrollLeft = box.scrollWidth; }, 0);
-  ui($('usageHeatmapCaption'), 'textContent', () => t("Estimated context processed per tool call · last 52 weeks"));
-  ui($('usageFormula'), 'textContent', () => t("Final frontend context (capped at {2} tokens for this estimate) × unique tool calls ÷ {0} × each model’s cached-input rate ÷ 1M × {1}.", [formula.divisor, formula.multiplier, snapshot!.contextTokenCap.toLocaleString(currentLanguage())]));
+  ui($('usageHeatmapCaption'), 'textContent', () => t("Estimated tokens per model round trip · last 52 weeks"));
+  ui($('usageFormula'), 'textContent', () => t("Each model round trip: new input × input rate + cached prefix × cached-input rate + visible output × output rate, ÷ 1M × {0}. Input is capped at {1} tokens; past {2} input tokens a round trip uses long-context rates (input ×2, output ×1.5).", [formula.multiplier, snapshot!.contextTokenCap.toLocaleString(currentLanguage()), LONG_CONTEXT_TOKENS.toLocaleString(currentLanguage())]));
   ui($('usageCost'), 'textContent', () => t("{0} estimated equivalent. {1}This is a comparison, not a bill.", [costText(total), total.unpricedTokens ? t("{0} tokens have no rate. ", [Math.round(total.unpricedTokens).toLocaleString(currentLanguage())]) : '']));
   const modelTable = el('table', 'usage-table'); const modelHead = el('tr');
   for (const title of ['Recorded model / effort', 'Estimated tokens', 'Estimated equivalent']) modelHead.append(el('th', '', () => t(title)));
@@ -239,9 +253,9 @@ function paintCost(): void {
   const breakdown = el('details', 'usage-breakdown');
   breakdown.append(el('summary', '', () => t("Daily breakdown")));
   const table = el('table', 'usage-table'); const head = el('tr');
-  head.append(el('th', '', () => t("Day")), el('th', '', () => t("Estimated tokens")), el('th', '', () => t("Cached × {0}", [formula.multiplier]))); table.append(head);
+  head.append(el('th', '', () => t("Day")), el('th', '', () => t("Estimated tokens")), el('th', '', () => t("Estimated equivalent"))); table.append(head);
   for (const day of [...daily].reverse()) { const row = el('tr'); row.append(el('td', '', () => dayLabel(day.date)), el('td', '', () => Math.round(day.tokens).toLocaleString(currentLanguage())), el('td', '', () => costText(day))); table.append(row); }
-  if (!snapshot.days.length) { const row = el('tr'); const cell = el('td', 'muted', () => t("No recorded tool calls yet.")); cell.setAttribute('colspan', '3'); row.append(cell); table.append(row); }
+  if (!snapshot.days.length) { const row = el('tr'); const cell = el('td', 'muted', () => t("No recorded model turns yet.")); cell.setAttribute('colspan', '3'); row.append(cell); table.append(row); }
   breakdown.append(table);
   const modelSection = el('section', 'usage-days-model');
   modelSection.append(el('h3', 'usage-cost-subhead', () => t('By model')), modelTable);
@@ -362,14 +376,12 @@ export function initUsage(): void {
   });
   try {
     const saved = JSON.parse(localStorage.getItem(FORMULA_KEY) ?? 'null');
-    if (saved && Number.isFinite(saved.divisor) && saved.divisor > 0 && Number.isFinite(saved.multiplier) && saved.multiplier >= 0 && saved.rates && typeof saved.rates === 'object' && !Array.isArray(saved.rates)) {
-      formula = { divisor: saved.divisor, multiplier: saved.multiplier, rates: { ...DEFAULT_USAGE_FORMULA.rates, ...Object.fromEntries(Object.entries(saved.rates).filter(([key, value]) => key.length <= 100 && (value === null || typeof value === 'number' && Number.isFinite(value) && value >= 0))) } as UsageFormula['rates'] };
+    if (saved && Number.isFinite(saved.multiplier) && saved.multiplier >= 0 && saved.rates && typeof saved.rates === 'object' && !Array.isArray(saved.rates)) {
+      formula = { multiplier: saved.multiplier, rates: { ...DEFAULT_USAGE_FORMULA.rates, ...Object.fromEntries(Object.entries(saved.rates).filter(([key, value]) => key.length <= 100 && (value === null || validUsageRate(value)))) } as UsageFormula['rates'] };
     }
   } catch { /* Invalid display preferences use the documented default. */ }
-  for (const [key, id] of [['divisor', 'usageDivisor'], ['multiplier', 'usageMultiplier']] as const) {
-    const input = $<HTMLInputElement>(id); input.value = String(formula[key]);
-    input.addEventListener('input', () => { if (input.value !== '' && input.validity.valid && Number.isFinite(input.valueAsNumber)) { formula[key] = input.valueAsNumber; saveFormula(); paintCost(); } });
-  }
+  const multiplier = $<HTMLInputElement>('usageMultiplier'); multiplier.value = String(formula.multiplier);
+  multiplier.addEventListener('input', () => { if (multiplier.value !== '' && multiplier.validity.valid && Number.isFinite(multiplier.valueAsNumber)) { formula.multiplier = multiplier.valueAsNumber; saveFormula(); paintCost(); } });
   $('refreshUsage').addEventListener('click', () => void refreshUsage(true));
   const exportButton = $<HTMLButtonElement>('exportUsage');
   exportButton.addEventListener('click', async () => {
@@ -378,7 +390,7 @@ export function initUsage(): void {
     exportButton.disabled = true;
     // Not run(): main's error names the chosen file's full path, which the page never shows.
     try {
-      const reply = await window.api.exportUsage(formula.divisor);
+      const reply = await window.api.exportUsage();
       if (!reply.ok) toast(t('Usage could not be exported.'));
       else if (reply.data.saved) toast(t('Saved {0}', [reply.data.name]));
     } catch { toast(t('Usage could not be exported.')); } finally {

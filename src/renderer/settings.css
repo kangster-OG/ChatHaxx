@@ -249,6 +249,9 @@
 .usage-formula-panel { margin-bottom: 20px; padding: 12px 18px 14px; }
 .usage-formula-panel > .muted { line-height: 1.55; }
 .usage-formula-panel a { color: var(--ink); text-decoration-color: var(--edge); text-underline-offset: 3px; }
+/* Input, cached input and output rates side by side; they wrap under the label on a narrow window. */
+.usage-rate-fields { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.usage-rate-fields input { width: 6.5em; }
 .usage-cost-groups { display: grid; gap: 28px; }
 .usage-cost-group { min-width: 0; }
 .usage-cost-group > h3 { margin: 0 0 10px; color: var(--ink); font-size: calc(13px * var(--text-scale, 1)); font-weight: 600; line-height: 1.4; }

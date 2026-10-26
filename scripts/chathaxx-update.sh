@@ -7,6 +7,7 @@
 # 2 dirty tree or wrong branch, other non-zero = a step failed (see the named log).
 #   --no-install   stop after the build
 #   --no-wait      install now instead of waiting for 15 idle minutes
+#   --force        rebuild and install even when the installed version matches (same-version source changes)
 set -euo pipefail
 
 UPSTREAM_REPO=totec448-spec/chat-on-steroids
@@ -15,11 +16,12 @@ LOGS=${CHATHAXX_LOGS:-$HOME/Developer/CoS-Fork-Control/logs}
 BACKUPS=${CHATHAXX_BACKUPS:-$HOME/Developer/CoS-backups}
 APP="/Applications/Chat On Steroids.app"
 DATA="$HOME/Library/Application Support/chat-on-steroids"
-INSTALL=1; WAIT=1
+INSTALL=1; WAIT=1; FORCE=0
 for arg in "$@"; do
   case $arg in
     --no-install) INSTALL=0 ;;
     --no-wait) WAIT=0 ;;
+    --force) FORCE=1 ;;
     *) echo "unknown option $arg"; exit 64 ;;
   esac
 done
@@ -59,7 +61,7 @@ fi
 version=$(node -p "require('./package.json').version")
 installed=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo none)
 echo "source $version, installed $installed"
-[[ $version == "$installed" ]] && { echo "RESULT: up to date"; exit 0; }
+[[ $version == "$installed" ]] && (( ! FORCE )) && { echo "RESULT: up to date"; exit 0; }
 
 step "build $version"
 [[ -d node_modules ]] || run npm-ci npm ci --no-audit --no-fund

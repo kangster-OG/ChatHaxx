@@ -16,7 +16,26 @@ export interface UsageModelTokens {
   reasoningEffort: string | null;
   /** Legacy rows with no recorded model use GPT-5.6 High, visibly marked as assumed. */
   assumed: boolean;
+  /** Every part below added together. */
   tokens: number;
+  parts: UsageTokenParts;
+}
+/**
+ * One model's estimated round trips, split the way the API bills them: new input, input the
+ * provider can serve from its prompt cache (the prefix the previous round trip already sent),
+ * and visible output. `long*` parts belong to round trips whose input passed
+ * LONG_CONTEXT_TOKENS, which the API bills at its long-context rates. Hidden reasoning is not
+ * visible on the page, so it is not here; the formula's multiplier stands in for it.
+ */
+export interface UsageTokenParts { input: number; cached: number; output: number; longInput: number; longCached: number; longOutput: number }
+export const USAGE_PART_KEYS = ['input', 'cached', 'output', 'longInput', 'longCached', 'longOutput'] as const satisfies ReadonlyArray<keyof UsageTokenParts>;
+export function emptyUsageParts(): UsageTokenParts { return { input: 0, cached: 0, output: 0, longInput: 0, longCached: 0, longOutput: 0 }; }
+export function addUsageParts(target: UsageTokenParts, add: Readonly<UsageTokenParts>): UsageTokenParts {
+  for (const key of USAGE_PART_KEYS) target[key] += add[key];
+  return target;
+}
+export function usagePartsTotal(parts: Readonly<UsageTokenParts>): number {
+  return USAGE_PART_KEYS.reduce((sum, key) => sum + parts[key], 0);
 }
 export interface UsageOverview {
   /** Account-wide comparison ceiling selected from the observed model catalog. */
@@ -69,25 +88,46 @@ export function usageMessageTotals(messages: UsageOverview['messages'], weekday:
     ? { ...total, gpt56: total.gpt56 + day.gpt56, gpt6: total.gpt6 + day.gpt6 } : total,
   { date: from, gpt56: 0, gpt6: 0 });
 }
+/** USD per million tokens, as the API's price list states them for its standard tier. */
+export interface UsageRate { input: number; cached: number; output: number }
 export interface UsageFormula {
-  divisor: number;
+  /** Stands in for hidden reasoning and request overhead the page cannot see. */
   multiplier: number;
-  rates: Record<string, number | null>;
+  rates: Record<string, UsageRate | null>;
 }
-// Standard short-context cached-input comparison rates verified 2026-09-27 (GPT-6 Sol and Luna added;
-// the earlier rates were unchanged).
-// GPT-6 Pro is ChatGPT's Astra label; Astra cached input is $1 per million tokens.
-// Sources are linked next to the editable formula and in usage-model-attribution.md.
+/** The API bills a request whose input passes this at its long-context rates. */
+export const LONG_CONTEXT_TOKENS = 272_000;
+/** Long-context rates are twice the input and cached-input rates and 1.5 times the output rate. */
+export const LONG_CONTEXT_INPUT_FACTOR = 2;
+export const LONG_CONTEXT_OUTPUT_FACTOR = 1.5;
+export const USAGE_RATES_CHECKED = '2026-10-26';
+// Standard-tier API rates from https://developers.openai.com/api/docs/pricing, checked 26 October
+// 2026. GPT-6 Pro is ChatGPT's Astra label. GPT-5.5 Pro has no cached-input rate, so its cached
+// input costs the full input rate. Sources are in usage-model-attribution.md.
 export const DEFAULT_USAGE_FORMULA: UsageFormula = {
-  divisor: 2, multiplier: 1.2,
-  rates: { 'gpt-5.6': 0.4, 'gpt-5.6-sol': 0.4, 'gpt-5.6-terra': 0.2, 'gpt-5.6-luna': 0.02, 'gpt-6-astra': 1, 'gpt-6-pro': 1, 'gpt-6-sol': 0.2, 'gpt-6-luna': 0.01, 'gpt-5.5': 0.5 }
+  multiplier: 1.2,
+  rates: {
+    'gpt-6-astra': { input: 10, cached: 1, output: 50 },
+    'gpt-6.1-sol': { input: 2, cached: 0.1, output: 10 },
+    'gpt-6.1-terra': { input: 1, cached: 0.05, output: 5 },
+    'gpt-6-sol': { input: 2, cached: 0.2, output: 10 },
+    'gpt-6-luna': { input: 0.1, cached: 0.01, output: 0.5 },
+    'gpt-5.6-sol': { input: 4, cached: 0.4, output: 20 },
+    'gpt-5.6-terra': { input: 2, cached: 0.2, output: 12 },
+    'gpt-5.6-luna': { input: 0.2, cached: 0.02, output: 1.2 },
+    'gpt-5.5': { input: 5, cached: 0.5, output: 30 },
+    'gpt-5.5-pro': { input: 30, cached: 30, output: 180 }
+  }
 };
 // Exact historical/provider identities only. This is a reporting projection, not
 // account availability or browser selection authority. Effort remains independent.
 const usageAliases: Readonly<Record<string, string>> = {
   '5.6': 'gpt-5.6-sol', 'gpt-5.6': 'gpt-5.6-sol', 'gpt-5-6': 'gpt-5.6-sol',
-  'gpt-5-6-instant': 'gpt-5.6-sol', 'gpt-5-6-thinking': 'gpt-5.6-sol', 'gpt-5-6-pro': 'gpt-5.6-sol',
+  'gpt-5-6-instant': 'gpt-5.6-sol', 'gpt-5-6-thinking': 'gpt-5.6-sol', 'gpt-5-6-pro': 'gpt-5.5-pro',
   '6': 'gpt-6-astra', 'gpt-6-pro': 'gpt-6-astra',
+  // ChatGPT's GPT-6 Instant and Thinking lanes have no published API identity; GPT-6 Sol is the
+  // closest priced model. GPT-5.6 Pro has none either; GPT-5.5 Pro is the only priced 5.x Pro.
+  'gpt-6': 'gpt-6-sol', 'gpt-6-thinking': 'gpt-6-sol', 'gpt-6-instant': 'gpt-6-sol',
   // ChatGPT labels these "5.5"; the API has one GPT-5.5 model with a cached-input rate.
   '5.5': 'gpt-5.5', 'gpt-5-5': 'gpt-5.5', 'gpt-5-5-instant': 'gpt-5.5', 'gpt-5-5-thinking': 'gpt-5.5'
 };
@@ -104,7 +144,7 @@ export function usageModelGroups(rows: readonly UsageModelTokens[]): Array<{ mod
   return [...groups.values()];
 }
 /** Explicit per-recorded-ID rates, including zero/null, override equivalent-model defaults. */
-export function usageRate(model: string, formula: UsageFormula): number | null | undefined {
+export function usageRate(model: string, formula: UsageFormula): UsageRate | null | undefined {
   if (Object.hasOwn(formula.rates, model)) return formula.rates[model];
   const canonical = usageModel(model);
   return Object.hasOwn(formula.rates, canonical) ? formula.rates[canonical] : undefined;
@@ -112,15 +152,22 @@ export function usageRate(model: string, formula: UsageFormula): number | null |
 export function usageModelKey(row: Pick<UsageModelTokens, 'model' | 'reasoningEffort' | 'assumed'>): string {
   return JSON.stringify([row.model, row.reasoningEffort, row.assumed]);
 }
-/** Cache stores the baseline /2 estimate; formula edits are a cheap projection, never a transcript reread. */
+export function validUsageRate(rate: unknown): rate is UsageRate {
+  return Boolean(rate) && typeof rate === 'object' && (['input', 'cached', 'output'] as const)
+    .every(key => typeof (rate as UsageRate)[key] === 'number' && Number.isFinite((rate as UsageRate)[key]) && (rate as UsageRate)[key] >= 0);
+}
+/** The cache stores token parts; formula edits are a cheap projection, never a transcript reread. */
 export function usageEstimate(rows: readonly UsageModelTokens[], formula: UsageFormula): { tokens: number; cost: number; unpricedTokens: number } {
   let tokens = 0, cost = 0, unpricedTokens = 0;
   for (const row of rows) {
-    const amount = row.tokens * 2 / formula.divisor;
-    tokens += amount;
+    tokens += row.tokens;
     const rate = usageRate(row.model, formula);
-    if (typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) cost += amount / 1e6 * rate * formula.multiplier;
-    else unpricedTokens += amount;
+    if (!validUsageRate(rate)) { unpricedTokens += row.tokens; continue; }
+    const { parts } = row;
+    const dollars = parts.input * rate.input + parts.cached * rate.cached + parts.output * rate.output
+      + (parts.longInput * rate.input + parts.longCached * rate.cached) * LONG_CONTEXT_INPUT_FACTOR
+      + parts.longOutput * rate.output * LONG_CONTEXT_OUTPUT_FACTOR;
+    cost += dollars / 1e6 * formula.multiplier;
   }
   return { tokens, cost, unpricedTokens };
 }
@@ -139,17 +186,16 @@ function usageCsvCell(value: string | number | null): string {
 /**
  * The Usage page as a CSV file: estimated tokens per day with the verified sends of the last
  * seven days beside them, then the latest limit reading. English column names keep the file
- * readable by scripts; it holds no path, chat, account or conversation id. `divisor` is the page's
- * own, so the tokens match what the page shows.
+ * readable by scripts; it holds no path, chat, account or conversation id.
  */
-export function usageCsv(overview: UsageOverview, divisor: number, exportedAt: number): string {
+export function usageCsv(overview: UsageOverview, exportedAt: number): string {
   const sentFrom = usageDateKey(new Date(usageWeekStart((new Date(overview.messages.through).getDay() + 1) % 7, overview.messages.through)));
   const sent = new Map(overview.messages.days.map(day => [day.date, day]));
-  const tokens = new Map(overview.days.map(day => [day.date, day.tokens * 2 / divisor]));
+  const tokens = new Map(overview.days.map(day => [day.date, day.tokens]));
   const dates = [...new Set([...tokens.keys(), ...sent.keys()])].sort();
   const rows: Array<Array<string | number | null>> = [
     ['Chat On Steroids usage export', usageCsvTime(exportedAt)],
-    ['Note', `Estimated tokens are this app's local estimate (final frontend context per unique tool call, divided by ${divisor}), not a provider invoice or exact token use. Messages sent count recorded native sends with verified model proof for the last 7 days only; they are not a quota. Limits are the latest reading only. Times are local.`],
+    ['Note', `Estimated tokens are this app's local estimate (the input and visible output of every model round trip; hidden reasoning is not visible), not a provider invoice or exact token use. Messages sent count recorded native sends with verified model proof for the last 7 days only; they are not a quota. Limits are the latest reading only. Times are local.`],
     [],
     ['Date', 'Estimated tokens', 'GPT-5.6 messages sent', 'GPT-6 messages sent'],
     ...dates.map(date => {

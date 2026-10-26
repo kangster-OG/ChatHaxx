@@ -3,8 +3,8 @@ import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { listUsageSessions, readEvents } from './store.js';
 import { readDurable, writeDurableSoon } from '../durable.js';
 import { logInfo } from '../logger.js';
-import { eventTokens } from '../../shared/session.js';
-import { usageDateKey, usageMessageFamily, usageModelKey, usageWeekStart, type ModelUsage, type UsageMessageDay, type UsageModelTokens, type UsageOverview } from '../../shared/usage.js';
+import { eventTokens, storedTextTokens } from '../../shared/session.js';
+import { LONG_CONTEXT_TOKENS, addUsageParts, emptyUsageParts, usageDateKey, usageMessageFamily, usageModelKey, usageWeekStart, type ModelUsage, type UsageMessageDay, type UsageModelTokens, type UsageOverview } from '../../shared/usage.js';
 import { getChatModels } from '../chat-models.js';
 import { isProModel } from '../../shared/chat-models.js';
 // An extension from before 2.1.40 sends wham/usage windows as "shared": they were Codex's all along.
@@ -29,9 +29,11 @@ export function reportedUsageLimits(): ModelUsage[] {
 }
 // One derived cache owns token totals and verified sends. Display preferences project
 // this baseline; only changed canonical session revisions reread transcripts.
-const CACHE_VERSION = 9;
+const CACHE_VERSION = 10;
 const SLOW_OVERVIEW_MS = 250;
-const modelTokens = z.object({ model: z.string().min(1).max(100), reasoningEffort: z.string().max(100).nullable(), assumed: z.boolean(), tokens: z.number().finite().nonnegative() });
+const tokenCount = z.number().finite().nonnegative();
+const modelTokens = z.object({ model: z.string().min(1).max(100), reasoningEffort: z.string().max(100).nullable(), assumed: z.boolean(), tokens: tokenCount,
+  parts: z.object({ input: tokenCount, cached: tokenCount, output: tokenCount, longInput: tokenCount, longCached: tokenCount, longOutput: tokenCount }) });
 const verifiedMessage = z.object({ id: z.string().min(1).max(512), time: z.number().finite().positive().max(8.64e15), model: z.enum(['gpt-5.6', 'gpt-6']) });
 type VerifiedMessage = z.infer<typeof verifiedMessage>;
 const cacheRow = z.object({ id: z.string().max(64), revision: z.string().max(200), days: z.array(z.tuple([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.array(modelTokens)])).max(36600), messages: z.array(verifiedMessage).max(100000) });
@@ -46,7 +48,7 @@ function mergeModels(target: Map<string, UsageModelTokens>, rows: readonly Usage
   for (const row of rows) {
     const key = usageModelKey(row);
     const previous = target.get(key);
-    target.set(key, { ...row, tokens: (previous?.tokens ?? 0) + row.tokens });
+    target.set(key, { ...row, tokens: (previous?.tokens ?? 0) + row.tokens, parts: addUsageParts(addUsageParts(emptyUsageParts(), previous?.parts ?? emptyUsageParts()), row.parts) });
   }
 }
 type Attribution = Pick<UsageModelTokens, 'model' | 'reasoningEffort' | 'assumed'>;
@@ -87,22 +89,33 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
       await yieldToEventLoop(undefined, { signal });
       rebuilt++;
       const perDay = new Map<string, Map<string, UsageModelTokens>>();
+      // Context the frontend holds now, and what the previous round trip sent and received:
+      // the provider's prompt cache can serve that prefix again on the next round trip.
       let context = 0;
+      let cachedPrefix = 0;
       let conversation: string | null = null;
       let selected = LEGACY;
-      const calls: Array<{ day: string; attribution: Attribution }> = [];
       const countedCalls = new Set<string>();
+      const countedAnswers = new Set<string>();
       const verified: VerifiedMessage[] = [];
-      const finishSegment = () => {
-        // Cap each frontend before the baseline divisor and call aggregation.
-        // Model switches divide attribution, never the frontend context.
-        const billingContext = Math.min(context, contextTokenCap);
-        for (const call of calls) {
-          const totals = perDay.get(call.day) ?? new Map<string, UsageModelTokens>();
-          mergeModels(totals, [{ ...call.attribution, tokens: billingContext / 2 }]);
-          perDay.set(call.day, totals);
-        }
-        calls.length = 0; context = 0; selected = LEGACY;
+      const finishSegment = () => { context = 0; cachedPrefix = 0; selected = LEGACY; };
+      // One model round trip: it reads the whole context and writes `written`, each capped at the
+      // ceiling, as no request carries more. Past LONG_CONTEXT_TOKENS of input the API
+      // bills the whole request at its long-context rates.
+      const roundTrip = (time: number, who: Attribution, written: number) => {
+        const input = Math.min(context, contextTokenCap);
+        const output = Math.min(written, contextTokenCap);
+        const cached = Math.min(cachedPrefix, input);
+        const long = input > LONG_CONTEXT_TOKENS;
+        const parts = emptyUsageParts();
+        parts[long ? 'longInput' : 'input'] = input - cached;
+        parts[long ? 'longCached' : 'cached'] = cached;
+        parts[long ? 'longOutput' : 'output'] = output;
+        const day = usageDateKey(new Date(time));
+        const totals = perDay.get(day) ?? new Map<string, UsageModelTokens>();
+        mergeModels(totals, [{ ...who, tokens: input + output, parts }]);
+        perDay.set(day, totals);
+        cachedPrefix = input + output;
       };
       const events = await readEvents(session.id);
       signal?.throwIfAborted();
@@ -142,11 +155,15 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
         // global picker or a worker's requested-but-unconfirmed spawn setting.
         if (event.kind === 'user_message' && !event.messageId?.startsWith('input:')) selected = LEGACY;
         if (event.kind !== 'user_message' || !event.messageId?.startsWith('input:')) selected = attribution(event, selected);
+        // A tool call is one round trip whose output is the call itself; its result is new
+        // context for the next one. A final answer is the turn's last round trip.
+        if (event.kind === 'tool_call') roundTrip(event.time, attribution(event.call, selected), storedTextTokens(event.call.args));
+        else if (event.kind === 'assistant_message' && (!event.messageId || !countedAnswers.has(event.messageId))) {
+          if (event.messageId) countedAnswers.add(event.messageId);
+          roundTrip(event.time, selected, eventTokens(event));
+        }
         context += eventTokens(event);
-        if (event.kind !== 'tool_call') continue;
-        const day = usageDateKey(new Date(event.time));
-        calls.push({ day, attribution: attribution(event.call, selected) });
-        if (!conversation) finishSegment();
+        if (event.kind === 'tool_call' && !conversation) finishSegment();
       }
       finishSegment();
       dirty = true;

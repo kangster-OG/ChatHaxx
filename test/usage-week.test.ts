@@ -36,8 +36,8 @@ it('groups explicit generation identities and rejects unknown versions and ambig
   }
 });
 
-it('prices both 5.6 lanes as Sol and leaves GPT-6 unpriced until an official rate is established', () => {
-  for (const model of ['gpt-5-6-instant', 'gpt-5-6-thinking']) expect(usageRate(usageModel(model), DEFAULT_USAGE_FORMULA), model).toBe(0.4);
-  // ChatGPT's GPT-6 lanes have no verified API identity (docs/usage-model-attribution.md); no rate is invented.
-  for (const model of ['gpt-6', 'gpt-6-thinking']) expect(usageRate(usageModel(model), DEFAULT_USAGE_FORMULA), model).toBeUndefined();
+it('prices both 5.6 lanes as Sol and estimates the GPT-6 lanes at GPT-6 Sol rates', () => {
+  for (const model of ['gpt-5-6-instant', 'gpt-5-6-thinking']) expect(usageRate(usageModel(model), DEFAULT_USAGE_FORMULA), model).toEqual({ input: 4, cached: 0.4, output: 20 });
+  // ChatGPT's GPT-6 lanes have no published API price; they are an editable estimate at GPT-6 Sol rates (docs/usage-model-attribution.md).
+  for (const model of ['gpt-6', 'gpt-6-thinking', 'gpt-6-instant']) expect(usageRate(usageModel(model), DEFAULT_USAGE_FORMULA), model).toEqual({ input: 2, cached: 0.2, output: 10 });
 });

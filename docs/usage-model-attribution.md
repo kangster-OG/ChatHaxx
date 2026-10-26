@@ -114,3 +114,20 @@ The four model keys present in the current usage cache are `gpt-5-6-thinking`, `
 Official Standard short-context cached-input rates were rechecked on 27 September 2026. Sol ($0.40), Terra ($0.20), Luna ($0.02), Astra ($1.00) and GPT-5.5 ($0.50) are unchanged. Two new models were added under their exact API IDs: [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) at $0.20 and [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) at $0.01.
 
 The ChatGPT IDs `gpt-5-5-instant` and `gpt-5-5-thinking`, labelled "5.5" in the live model catalog, were unpriced. They now alias `gpt-5.5`, the one GPT-5.5 API model with a cached-input rate. ChatGPT's plain `gpt-6` still has no alias, because which API model it corresponds to is not established.
+
+## Cost per model round trip, 26 October 2026
+
+The estimate now prices each model round trip, not cached input alone. Each tool call and each
+assistant answer counts once: input is the context before it (capped), cached input is the part the
+previous round trip already sent, and output is the written tool arguments or answer. Input above
+272,000 tokens uses the long-context prices (input and cached input ×2, output ×1.5). The 1.2
+multiplier now stands for hidden reasoning, which the page cannot see. The token divisor was removed.
+
+Standard API prices (input / cached input / output, USD per million) were checked on 26 October 2026
+at https://developers.openai.com/api/docs/pricing for GPT-6 Astra, GPT-6.1 Sol and Terra, GPT-6 Sol
+and Luna, GPT-5.6 Sol, Terra and Luna, GPT-5.5 and GPT-5.5 Pro.
+
+ChatGPT's `gpt-6`, `gpt-6-instant` and `gpt-6-thinking` lanes still have no published API identity.
+They now default to GPT-6 Sol prices as a labelled estimate, which reverses the 7 October choice
+above, because those lanes carry most recorded tokens and leaving them unpriced hid most of the cost.
+The page says so, and a manual rate replaces it. `gpt-5-6-pro` now uses GPT-5.5 Pro prices.

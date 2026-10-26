@@ -240,8 +240,8 @@ const api = {
   getUsage: () => call<UsageOverview>('usage:get'),
   /** Codex's and Claude Code's usage from their logs here; `fresh` skips the 30-second cache. */
   getProviderUsage: (fresh = false) => call<ProviderUsage>('usage:providers', { fresh }),
-  /** Saves the Usage page as CSV through a save dialog; `divisor` is the page's token divisor. */
-  exportUsage: (divisor: number) => call<{ saved: false } | { saved: true; name: string }>('usage:export', { divisor }),
+  /** Saves the Usage page as CSV through a save dialog. */
+  exportUsage: () => call<{ saved: false } | { saved: true; name: string }>('usage:export'),
   getState: () => call<AppState>('state:get'),
   resetPluginRefresh: () => call<AppState>('plugin-refresh:reset'),
   /** Sets an unreadable credentials file aside (kept as a backup) so keys can be saved again. */

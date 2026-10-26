@@ -726,15 +726,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   handle('usage:get', () => usageOverview());
   handle('usage:providers', (payload) => readProviderUsage({ fresh: z.object({ fresh: z.boolean() }).parse(payload).fresh }));
-  // The page sends only its divisor, so the file's tokens match the page; main reads the numbers.
-  handle('usage:export', (payload) => {
-    const request = z.object({ divisor: z.number().finite().positive() }).safeParse(payload);
-    if (!request.success) {
-      logWarn('usage export: refused, the page sent no positive, finite token divisor');
-      throw request.error;
-    }
-    return exportUsageCsv(request.data.divisor, getWindow());
-  });
+  // The page sends nothing: main reads the numbers, so the file matches the page's tokens.
+  handle('usage:export', () => exportUsageCsv(getWindow()));
   handle('plugin-refresh:reset', async () => {
     await resetPluginRefreshLedger();
     return buildState();

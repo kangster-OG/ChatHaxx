@@ -40,7 +40,7 @@ beforeEach(() => {
 
 it('saves daily estimated tokens, the last week of sends and the latest limits as CSV', async () => {
   electron.dialog.showSaveDialog.mockResolvedValue({ canceled: false, filePath: '/downloads/usage.csv' });
-  await expect(exportUsageCsv(2, null)).resolves.toEqual({ saved: true, name: 'usage.csv' });
+  await expect(exportUsageCsv(null)).resolves.toEqual({ saved: true, name: 'usage.csv' });
   expect(electron.dialog.showSaveDialog.mock.calls[0]![0]).toMatchObject({
     title: 'Export usage as CSV', message: 'Export usage as CSV',
     defaultPath: expect.stringMatching(/chat-on-steroids-usage-\d{4}-\d{2}-\d{2}\.csv$/),
@@ -55,7 +55,7 @@ it('saves daily estimated tokens, the last week of sends and the latest limits a
   // Excel reads UTF-8 only with a byte-order mark; rows end in CRLF as RFC 4180 has it.
   expect(csv.startsWith('﻿Chat On Steroids usage export,')).toBe(true);
   const lines = rows(csv);
-  expect(lines[1]).toMatch(/^Note,"Estimated tokens are this app's local estimate .*divided by 2\), not a provider invoice/);
+  expect(lines[1]).toMatch(/^Note,"Estimated tokens are this app's local estimate .*every model round trip.*, not a provider invoice/);
   expect(lines.slice(3, 9)).toEqual([
     'Date,Estimated tokens,GPT-5.6 messages sent,GPT-6 messages sent',
     // Before the counted week there is no send count, which is not the same as none.
@@ -72,10 +72,10 @@ it('saves daily estimated tokens, the last week of sends and the latest limits a
   ]);
 });
 
-it('follows the page divisor, so the file shows the tokens the page shows', () => {
-  const lines = rows(usageCsv(overview, 4, at(20)));
-  expect([lines[4], lines[6]]).toEqual(['2026-09-30,500,,', '2026-10-19,125000,4,3']);
-  expect(lines[1]).toContain('divided by 4)');
+it('writes the estimated tokens as recorded, rounded to whole tokens', () => {
+  const lines = rows(usageCsv(overview, at(20)));
+  expect([lines[4], lines[6]]).toEqual(['2026-09-30,1000,,', '2026-10-19,250000,4,3']);
+  expect(lines[1]).not.toContain('divided by');
 });
 
 it('quotes commas and quotes, and keeps a spreadsheet from running a reported name as a formula', () => {
@@ -83,7 +83,7 @@ it('quotes commas and quotes, and keeps a spreadsheet from running a reported na
     { ...overview.limits[0]!, model: '=HYPERLINK("x"),1' }, { ...overview.limits[0]!, model: '-2+3' },
     // Some spreadsheets skip a leading line break and run what follows.
     { ...overview.limits[0]!, model: '\n=1+1' }
-  ] }, 2, at(20)));
+  ] }, at(20)));
   expect(lines.slice(6, 9)).toEqual([
     `"'=HYPERLINK(""x""),1",model,12,,3,2026-10-21 09:05,2026-10-20 11:58`,
     `'-2+3,model,12,,3,2026-10-21 09:05,2026-10-20 11:58`,
@@ -93,7 +93,7 @@ it('quotes commas and quotes, and keeps a spreadsheet from running a reported na
 
 it('writes nothing when the save dialog is cancelled', async () => {
   electron.dialog.showSaveDialog.mockResolvedValue({ canceled: true });
-  await expect(exportUsageCsv(2, null)).resolves.toEqual({ saved: false });
+  await expect(exportUsageCsv(null)).resolves.toEqual({ saved: false });
   expect(files.writeFile).not.toHaveBeenCalled();
   expect(usage.usageOverview).not.toHaveBeenCalled();
 });
@@ -102,7 +102,7 @@ it('writes nothing when the save dialog is cancelled', async () => {
 it('leaves an earlier export whole when the write fails, and logs why without the path', async () => {
   electron.dialog.showSaveDialog.mockResolvedValue({ canceled: false, filePath: '/downloads/usage.csv' });
   files.writeFile.mockRejectedValueOnce(Object.assign(new Error("ENOSPC: no space left on device, open '/downloads/.usage.csv.tmp'"), { code: 'ENOSPC' }));
-  await expect(exportUsageCsv(2, null)).rejects.toThrow('ENOSPC');
+  await expect(exportUsageCsv(null)).rejects.toThrow('ENOSPC');
   const [file] = files.writeFile.mock.calls[0]! as unknown as [string];
   expect(file).not.toBe('/downloads/usage.csv');
   expect(files.rename).not.toHaveBeenCalled();

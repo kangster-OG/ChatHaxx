@@ -4,6 +4,8 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { UsageOverview } from '../src/shared/usage.js';
 import type { ProviderUsage } from '../src/shared/provider-usage.js';
 
+// A row whose tokens are all cached input costs tokens × the model's cached-input rate.
+const cachedParts = (tokens: number) => ({ input: 0, cached: tokens, output: 0, longInput: 0, longCached: 0, longOutput: 0 });
 let dom: JSDOM;
 /**
  * The renderer prints money and compact counts in the app's language, like every other number on
@@ -118,8 +120,8 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const models = [
-    { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 1e6 },
-    { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 1e6 }
+    { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 1e6, parts: cachedParts(1e6) },
+    { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 1e6, parts: cachedParts(1e6) }
   ];
   const data: UsageOverview = { contextTokenCap, messages: { through: Date.now(), days: [] }, tokens: 2e6, models, days: [{ date: '2026-09-05', tokens: 2e6, models }], projects: [], sessions: 1, limits: ['deep_research', 'file_upload', 'paste_text_to_file', 'image_gen'].map(model => ({ model, scope: 'feature', remaining: 3, remainingPercent: 50, resetAt: null, windowSeconds: null, observedAt: Date.now() })) };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
@@ -128,12 +130,13 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   const field = (id: string) => dom.window.document.getElementById(id) as HTMLInputElement;
   const change = (input: HTMLInputElement, value: string) => { input.value = value; input.dispatchEvent(new dom.window.Event('input')); };
   const cost = () => dom.window.document.getElementById('usageTotalCost')!.textContent;
-  const divisor = field('usageDivisor');
+  const multiplier = field('usageMultiplier');
   initUsage(); await refreshUsage();
   expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain(`capped at ${contextTokenCap.toLocaleString('en')} tokens`);
   const formulaDetails = dom.window.document.getElementById('usageFormulaDetails') as HTMLDetailsElement;
   expect(formulaDetails.open).toBe(false);
-  expect(divisor.closest('details')).toBe(formulaDetails);
+  expect(multiplier.closest('details')).toBe(formulaDetails);
+  expect(field('usageDivisor')).toBeNull();
   expect(dom.window.document.getElementById('usageRates')!.closest('details')).toBe(formulaDetails);
   expect(dom.window.document.getElementById('usageDays')!.closest('details')).toBeNull();
   expect(dom.window.document.getElementById('usageTotalCost')!.closest('details')).toBeNull();
@@ -142,36 +145,38 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   const balances = dom.window.document.getElementById('modelUsage')!;
   for (const label of ['Deep research', 'File uploads', 'Pasted text files', 'Image generation']) expect(balances.textContent).toContain(label);
   expect(balances.textContent).not.toMatch(/deep_research|file_upload|paste_text_to_file|image_gen|below/);
-  expect(field('usageDivisor')).toBe(divisor);
   expect(dom.window.document.getElementById('costModel')).toBeNull();
   // Unpriced tokens make the priced sum a lower bound.
   expect(cost()).toContain(`≥ ${usd(0.48)}`);
-  change(divisor, '4');
-  expect(cost()).toContain(usd(0.24));
-  expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain('÷ 4');
   formulaDetails.querySelector('summary')!.click();
   expect(formulaDetails.open).toBe(false);
-  expect(cost()).toContain(usd(0.24));
-  change(divisor, '0'); // Invalid edits do not corrupt the active calculation.
-  expect(cost()).toContain(usd(0.24));
-  const unknownRate = dom.window.document.querySelector('input[aria-label="another-model cached-input USD per million tokens"]') as HTMLInputElement;
-  change(unknownRate, '1');
-  expect(cost()).toContain(usd(0.84)); expect(cost()).not.toContain('≥');
-  change(field('usageMultiplier'), '1');
-  expect(cost()).toContain(usd(0.7));
+  change(multiplier, '-1'); // Invalid edits do not corrupt the active calculation.
+  expect(cost()).toContain(`≥ ${usd(0.48)}`);
+  const unknownRate = (part: string) => dom.window.document.querySelector(`input[aria-label="another-model ${part} USD per million tokens"]`) as HTMLInputElement;
+  change(unknownRate('input'), '3');
+  change(unknownRate('cached-input'), '1');
+  // A rate needs all three parts; until then the model stays unpriced.
+  expect(cost()).toContain(`≥ ${usd(0.48)}`);
+  change(unknownRate('output'), '5');
+  expect(cost()).toContain(usd(1.68)); expect(cost()).not.toContain('≥');
+  change(multiplier, '1');
+  expect(cost()).toContain(usd(1.4));
+  expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain('× 1.');
   expect(getUsage).toHaveBeenCalledTimes(1);
-  expect(JSON.parse(dom.window.localStorage.getItem('usage-formula-v1')!)).toMatchObject({ divisor: 4, multiplier: 1, rates: { 'gpt-5.6': 0.4, 'gpt-5.6-sol': 0.4, 'gpt-6-astra': 1, 'gpt-5.5': 0.5, 'another-model': 1 } });
+  expect(JSON.parse(dom.window.localStorage.getItem('usage-formula-v2')!)).toMatchObject({ multiplier: 1, rates: {
+    'gpt-5.6-sol': { input: 4, cached: 0.4, output: 20 }, 'gpt-6-astra': { input: 10, cached: 1, output: 50 }, 'another-model': { input: 3, cached: 1, output: 5 } } });
   vi.resetModules();
   const restored = await import('../src/renderer/usage.js');
   restored.initUsage(); await restored.refreshUsage();
-  expect(field('usageDivisor').value).toBe('4'); expect(field('usageMultiplier').value).toBe('1');
-  expect(cost()).toContain(usd(0.7));
+  expect(field('usageMultiplier').value).toBe('1');
+  expect(unknownRate('output').value).toBe('5');
+  expect(cost()).toContain(usd(1.4));
 });
 
 it('shows the Sol picker alias rate and preserves an explicitly cleared rate after reload', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
-  const models = [{ model: 'gpt-5-6-thinking', reasoningEffort: 'high', assumed: false, tokens: 427245 }];
+  const models = [{ model: 'gpt-5-6-thinking', reasoningEffort: 'high', assumed: false, tokens: 427245, parts: cachedParts(427245) }];
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 427245, models, days: [{ date: '2026-09-07', tokens: 427245, models }], projects: [], sessions: 1, limits: [] };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
@@ -194,7 +199,7 @@ it('shows the Sol picker alias rate and preserves an explicitly cleared rate aft
 it('combines equivalent recorded names in the table while keeping raw rate edits and partial unknown cost', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
-  const models = ['5.6', 'gpt-5-6-thinking', 'gpt-5.6-sol'].map(model => ({ model, reasoningEffort: 'high', assumed: false, tokens: 1e6 }));
+  const models = ['5.6', 'gpt-5-6-thinking', 'gpt-5.6-sol'].map(model => ({ model, reasoningEffort: 'high', assumed: false, tokens: 1e6, parts: cachedParts(1e6) }));
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 3e6, models, days: [{ date: '2026-09-08', tokens: 3e6, models }], projects: [], sessions: 1, limits: [] };
   const getUsage = vi.fn(async () => ({ ok: true, data }));
   Object.assign(dom.window, { api: { getUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
@@ -204,7 +209,7 @@ it('combines equivalent recorded names in the table while keeping raw rate edits
   expect(table().textContent).toContain('gpt-5.6-sol · high');
   expect(table().textContent).toContain(usd(1.44));
   expect(table().querySelector('[data-usage-hint]')!.getAttribute('data-usage-hint')).toBe('Recorded IDs: 5.6, gpt-5-6-thinking, gpt-5.6-sol');
-  expect(dom.window.document.querySelectorAll('#usageRates input')).toHaveLength(3);
+  expect(dom.window.document.querySelectorAll('#usageRates input')).toHaveLength(9);
   const rate = dom.window.document.querySelector('input[aria-label="5.6 cached-input USD per million tokens"]') as HTMLInputElement;
   rate.value = ''; rate.dispatchEvent(new dom.window.Event('input'));
   expect(table().textContent).toContain(`≥ ${usd(0.96)}`);
@@ -217,8 +222,8 @@ it.each(['2026-09-28', '2026-10-01', '2027-01-01', '2028-02-29'])('draws an annu
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   const key = (ago: number) => { const date = new Date(); date.setDate(date.getDate() - ago); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; };
-  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6 }];
-  const days = [{ date: key(3), tokens: 1e6, models }, { date: key(0), tokens: 4e6, models: [{ ...models[0]!, tokens: 4e6 }] }]; // Oldest first, as the main process sends them.
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6, parts: cachedParts(1e6) }];
+  const days = [{ date: key(3), tokens: 1e6, models }, { date: key(0), tokens: 4e6, models: [{ ...models[0]!, tokens: 4e6, parts: cachedParts(4e6) }] }]; // Oldest first, as the main process sends them.
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 5e6, models, days, projects: [], sessions: 1, limits: [] };
   Object.assign(dom.window, { api: { getUsage: async () => ({ ok: true, data }), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const usage = await import('../src/renderer/usage.js'); usage.initUsage(); await usage.refreshUsage();
@@ -249,7 +254,7 @@ it.each(['2026-09-28', '2026-10-01', '2027-01-01', '2028-02-29'])('draws an annu
 it('prints totals and amounts in the app language and follows a language change', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
-  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 8.5e9 }];
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 8.5e9, parts: cachedParts(8.5e9) }];
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 8.5e9, models, days: [{ date: '2026-09-08', tokens: 8.5e9, models }], projects: [], sessions: 1, limits: [] };
   Object.assign(dom.window, { api: { getUsage: vi.fn(async () => ({ ok: true, data })), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
@@ -273,7 +278,7 @@ it('prints totals and amounts in the app language and follows a language change'
 it('prints estimated token counts as whole numbers where compact notation keeps the thousands', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
-  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 307_373.5 }];
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 307_373.5, parts: cachedParts(307_373.5) }];
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 307_373.5, models, days: [{ date: '2026-10-08', tokens: 307_373.5, models }], projects: [], sessions: 1, limits: [] };
   Object.assign(dom.window, { api: { getUsage: vi.fn(async () => ({ ok: true, data })), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
   const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
@@ -336,7 +341,7 @@ it('shows other apps’ reported limits apart from tokens counted here, and says
   expect(host.textContent).not.toContain('Codex ·');
 });
 
-it('exports the page as CSV beside Refresh, with the page divisor, and says where it saved', async () => {
+it('exports the page as CSV beside Refresh and says where it saved', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
   let finish!: (reply: unknown) => void;
@@ -348,13 +353,11 @@ it('exports the page as CSV beside Refresh, with the page divisor, and says wher
   const button = element('exportUsage') as HTMLButtonElement;
   expect(button.closest('.settings-section-head')).toBe(element('refreshUsage').closest('.settings-section-head'));
   expect(button.textContent).toBe('Export CSV');
-  const divisor = element('usageDivisor') as HTMLInputElement;
-  divisor.value = '4'; divisor.dispatchEvent(new dom.window.Event('input'));
   button.click();
   // A second click while the dialog is open asks for nothing more.
   button.click();
   expect(exportUsage).toHaveBeenCalledTimes(1);
-  expect(exportUsage).toHaveBeenCalledWith(4);
+  expect(exportUsage).toHaveBeenCalledWith();
   expect(button.disabled).toBe(true);
   finish({ ok: true, data: { saved: true, name: 'chat-on-steroids-usage-2026-10-20.csv' } });
   await vi.waitFor(() => expect(button.disabled).toBe(false), { timeout: 5000 });
@@ -394,18 +397,18 @@ it('gives keyboard focus back to Export CSV after the dialog, unless the person 
   await vi.waitFor(() => expect(document.activeElement).toBe(button), { timeout: 5000 });
 
   button.click();
-  const divisor = document.getElementById('usageDivisor') as HTMLInputElement;
-  divisor.focus();
+  const multiplier = document.getElementById('usageMultiplier') as HTMLInputElement;
+  multiplier.focus();
   finish({ ok: true, data: { saved: false } });
   await vi.waitFor(() => expect(button.disabled).toBe(false), { timeout: 5000 });
-  expect(document.activeElement).toBe(divisor);
+  expect(document.activeElement).toBe(multiplier);
 });
 
 it('breaks the estimate down by project, naming each from the project list, and follows formula edits', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
-  const sol = (tokens: number) => ({ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens });
-  const unpriced = { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 2e6 };
+  const sol = (tokens: number) => ({ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens, parts: cachedParts(tokens) });
+  const unpriced = { model: 'another-model', reasoningEffort: 'low', assumed: false, tokens: 2e6, parts: cachedParts(2e6) };
   const models = [sol(1.5e6), unpriced];
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 3.5e6, models, days: [{ date: '2026-09-08', tokens: 3.5e6, models }], sessions: 4, limits: [],
     projects: [{ projectId: null, tokens: 2e6, models: [unpriced] }, { projectId: 'project-a', tokens: 1e6, models: [sol(1e6)] }, { projectId: 'project-gone', tokens: 5e5, models: [sol(5e5)] }] };
@@ -424,9 +427,9 @@ it('breaks the estimate down by project, naming each from the project list, and 
     ['Website', (1e6).toLocaleString('en'), usd(0.48)],
     ['Unknown project', (5e5).toLocaleString('en'), usd(0.24)]
   ]);
-  const divisor = dom.window.document.getElementById('usageDivisor') as HTMLInputElement;
-  divisor.value = '4'; divisor.dispatchEvent(new dom.window.Event('input'));
-  expect(rows()[2]).toEqual(['Website', (5e5).toLocaleString('en'), usd(0.24)]);
+  const multiplier = dom.window.document.getElementById('usageMultiplier') as HTMLInputElement;
+  multiplier.value = '0.6'; multiplier.dispatchEvent(new dom.window.Event('input'));
+  expect(rows()[2]).toEqual(['Website', (1e6).toLocaleString('en'), usd(0.24)]);
   setLanguage('de');
   expect(rows()[1]![0]).toBe('Kein Projekt');
   setLanguage('en');
@@ -445,7 +448,7 @@ it('breaks the estimate down by project, naming each from the project list, and 
 it('shows usage while the project list is still loading, then names the By project rows', async () => {
   dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
   vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
-  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6 }];
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 1e6, parts: cachedParts(1e6) }];
   const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 1e6, models, days: [{ date: '2026-09-08', tokens: 1e6, models }], sessions: 1, limits: [],
     projects: [{ projectId: 'project-a', tokens: 1e6, models }] };
   let answer!: (reply: unknown) => void;

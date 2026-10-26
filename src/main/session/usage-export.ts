@@ -10,7 +10,7 @@ import { usageOverview } from './usage.js';
 export type UsageExportResult = { saved: false } | { saved: true; name: string };
 
 /** Saves the Usage page's daily estimates, recent sends and latest limits where the person chooses. */
-export async function exportUsageCsv(divisor: number, owner: BrowserWindow | null): Promise<UsageExportResult> {
+export async function exportUsageCsv(owner: BrowserWindow | null): Promise<UsageExportResult> {
   const now = Date.now();
   const options = {
     ...dialogLabel('Export usage as CSV'),
@@ -20,7 +20,7 @@ export async function exportUsageCsv(divisor: number, owner: BrowserWindow | nul
   const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options);
   if (result.canceled || !result.filePath) return { saved: false };
   // Read after the dialog, so the file holds the limits as they are when it is written.
-  const csv = usageCsv(await usageOverview(), divisor, Date.now());
+  const csv = usageCsv(await usageOverview(), Date.now());
   // Write beside the chosen file and then replace it, so a failed write leaves an earlier export whole.
   const temporary = path.join(path.dirname(result.filePath), `.${path.basename(result.filePath)}.${randomUUID()}.tmp`);
   try {
