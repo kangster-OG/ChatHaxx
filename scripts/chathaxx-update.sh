@@ -70,6 +70,15 @@ run package npm run dist:dir:mac:arm64
 git checkout -- THIRD-PARTY-NOTICES.txt
 NEW="$REPO_DIR/release/mac-arm64/Chat On Steroids.app"
 [[ $(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$NEW/Contents/Info.plist") == "$version" ]] || { echo "built app has the wrong version"; exit 1; }
+# An ad-hoc seal's identity is its cdhash, so macOS forgets Accessibility and Screen Recording
+# grants on every update. Re-sign with this Mac's Apple Development identity so the designated
+# requirement (bundle id + certificate) stays the same from one build to the next.
+SIGN_ID=${CHATHAXX_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/"Apple Development: /{print $2; exit}')}
+if [[ -n $SIGN_ID ]]; then
+  run sign codesign --force --deep --sign "$SIGN_ID" "$NEW"
+else
+  echo "warning: no Apple Development identity; the app stays ad-hoc and loses macOS permissions on update"
+fi
 codesign --verify --deep --strict "$NEW"
 (( INSTALL )) || { echo "RESULT: built $version at $NEW (not installed)"; exit 0; }
 

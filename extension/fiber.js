@@ -259,6 +259,18 @@
     return typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(value) ? value : null;
   }
 
+  // The server stamps the answering model on the stored message (snake_case) and the client's own
+  // message objects (camelCase). A selector default such as default_model_slug is not proof.
+  function replyModelOf(message, meta) {
+    for (const source of [meta, message]) {
+      if (!source || typeof source !== 'object') continue;
+      const slug = modelSlugOf(source.resolved_model_slug) || modelSlugOf(source.resolvedModelSlug) ||
+        modelSlugOf(source.model_slug) || modelSlugOf(source.modelSlug);
+      if (slug) return slug;
+    }
+    return null;
+  }
+
   function num(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : null;
   }
@@ -665,7 +677,7 @@
       const workingTurnId = meta ? str(meta.working_turn_id) : null;
       const turnExchangeId = meta ? str(meta.turn_exchange_id) : null;
       // The server's own answer to "which model produced this": the only per-reply model proof.
-      const resolvedModel = meta ? modelSlugOf(meta.resolved_model_slug) || modelSlugOf(meta.model_slug) : null;
+      const resolvedModel = replyModelOf(message, meta);
       const createTime = authoredTime(message);
       const authoredId = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, createTime);
       // Two messages of one branch sharing a creation millisecond would collide on that

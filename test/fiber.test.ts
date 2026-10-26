@@ -1127,9 +1127,16 @@ describe('the calls a turn says it made', () => {
     fallback.metadata = { ...fallback.metadata, model_slug: 'gpt-6-pro' };
     const hostile = authored('hostile', 'Answer three');
     hostile.metadata = { ...hostile.metadata, resolved_model_slug: 'gpt-6 <img src=x>' };
-    const result = await scan([], [{ id: 'model-turn', messages: [resolved, fallback, hostile], conversationProps: { conversationId: THREAD } }]);
+    const client = authored('client', 'Answer four') as any;
+    client.metadata = { ...client.metadata, modelSlug: 'gpt-6-thinking', default_model_slug: 'gpt-6' };
+    const topLevel = authored('top', 'Answer five') as any;
+    topLevel.resolvedModelSlug = 'gpt-5-6-pro';
+    const defaultOnly = authored('default', 'Answer six') as any;
+    defaultOnly.metadata = { ...defaultOnly.metadata, default_model_slug: 'gpt-6' };
+    const result = await scan([], [{ id: 'model-turn', messages: [resolved, fallback, hostile, client, topLevel, defaultOnly], conversationProps: { conversationId: THREAD } }]);
     const byId = Object.fromEntries(result.turns[0]!.messages.map((row: any) => [row.rawText, row.resolvedModel]));
-    expect(byId).toEqual({ Answer: 'gpt-5-6-thinking', 'Answer two': 'gpt-6-pro', 'Answer three': undefined });
+    expect(byId).toEqual({ Answer: 'gpt-5-6-thinking', 'Answer two': 'gpt-6-pro', 'Answer three': undefined,
+      'Answer four': 'gpt-6-thinking', 'Answer five': 'gpt-5-6-pro', 'Answer six': undefined });
   });
 
   it('carries the sources behind each citation pill, by the reply and reference index its props name', async () => {
