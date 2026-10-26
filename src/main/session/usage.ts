@@ -29,7 +29,7 @@ export function reportedUsageLimits(): ModelUsage[] {
 }
 // One derived cache owns token totals and verified sends. Display preferences project
 // this baseline; only changed canonical session revisions reread transcripts.
-const CACHE_VERSION = 10;
+const CACHE_VERSION = 11;
 const SLOW_OVERVIEW_MS = 250;
 const tokenCount = z.number().finite().nonnegative();
 const modelTokens = z.object({ model: z.string().min(1).max(100), reasoningEffort: z.string().max(100).nullable(), assumed: z.boolean(), tokens: tokenCount,
@@ -53,6 +53,35 @@ function mergeModels(target: Map<string, UsageModelTokens>, rows: readonly Usage
 }
 type Attribution = Pick<UsageModelTokens, 'model' | 'reasoningEffort' | 'assumed'>;
 const LEGACY: Attribution = { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true };
+/**
+ * Most round trips record no model of their own. The nearest model the same chat recorded,
+ * else the nearest in the same session, is a far better guess than LEGACY. It stays marked
+ * as assumed, so the page never presents it as proof.
+ */
+function nearestAttribution(events: Awaited<ReturnType<typeof readEvents>>): (time: number, conversation: string | null) => Attribution | null {
+  const known: { time: number; conversation: string | null; who: Attribution }[] = [];
+  let conversation: string | null = null;
+  for (const event of events) {
+    if (event.kind === 'session_start') conversation = event.conversationId ?? null;
+    if (event.kind === 'tool_call' && event.call.nested === true) continue;
+    if (event.kind === 'tool_call' && event.call.conversationId) conversation = event.call.conversationId;
+    const raw = event.kind === 'tool_call' ? event.call : event.kind === 'user_message' && !event.messageId?.startsWith('input:') ? event : null;
+    const model = raw?.model?.trim();
+    if (model && Number.isFinite(event.time)) known.push({ time: event.time, conversation, who: { model, reasoningEffort: raw?.reasoningEffort?.trim() || null, assumed: true } });
+  }
+  return (time, at) => {
+    let best: { gap: number; who: Attribution } | null = null;
+    for (const sameChat of [true, false]) {
+      for (const entry of known) {
+        if (sameChat && (at === null || entry.conversation !== at)) continue;
+        const gap = Math.abs(entry.time - time);
+        if (!best || gap < best.gap) best = { gap, who: entry.who };
+      }
+      if (best) return best.who;
+    }
+    return null;
+  };
+}
 function attribution(raw: { model?: string; reasoningEffort?: string }, previous: Attribution): Attribution {
   const model = raw.model?.trim();
   const effort = raw.reasoningEffort?.trim();
@@ -102,7 +131,8 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
       // One model round trip: it reads the whole context and writes `written`, each capped at the
       // ceiling, as no request carries more. Past LONG_CONTEXT_TOKENS of input the API
       // bills the whole request at its long-context rates.
-      const roundTrip = (time: number, who: Attribution, written: number) => {
+      const roundTrip = (time: number, recorded: Attribution, written: number) => {
+        const who = recorded.assumed ? nearest(time, conversation) ?? recorded : recorded;
         const input = Math.min(context, contextTokenCap);
         const output = Math.min(written, contextTokenCap);
         const cached = Math.min(cachedPrefix, input);
@@ -119,6 +149,7 @@ async function computeOverview(signal?: AbortSignal): Promise<UsageOverview> {
       };
       const events = await readEvents(session.id);
       signal?.throwIfAborted();
+      const nearest = nearestAttribution(events);
       // A send typed on the page carries no model of its own. The reply that answers it does:
       // ChatGPT's server stamps it with the model that actually ran. Only that reply, before
       // the next send, may prove the model — never the picker or a later tool.

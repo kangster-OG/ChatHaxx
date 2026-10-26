@@ -343,7 +343,7 @@ describe('passive usage limits and canonical token totals', () => {
     expect(await usage.usageOverview()).toMatchObject({ contextTokenCap: 256_000, tokens: 256_000 });
     expect(store.readEvents).toHaveBeenCalledTimes(1);
   });
-  it.each([4, 5, 6, 7, 8, 9])('rebuilds old cache version %i and reuses the corrected cache after restart', async (version) => {
+  it.each([4, 5, 6, 7, 8, 9, 10])('rebuilds old cache version %i and reuses the corrected cache after restart', async (version) => {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     durable.readDurable.mockResolvedValue({ version, rows: [{ id: 'one', revision: `${timezone}:1:1:2000000`, days: [['2026-09-05', [{ model: 'gpt-6-pro', reasoningEffort: null, assumed: false, tokens: 1_000_000 }]]] }] });
     store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 1, events: 1, estimatedTokens: 2_000_000 }]);
@@ -351,7 +351,7 @@ describe('passive usage limits and canonical token totals', () => {
     expect((await usage.usageOverview()).tokens).toBe(256_000);
     expect(store.readEvents).toHaveBeenCalledTimes(1);
     const persisted = durable.writeDurableSoon.mock.calls.at(-1)![1];
-    expect(persisted.version).toBe(10);
+    expect(persisted.version).toBe(11);
     vi.resetModules(); durable.readDurable.mockResolvedValue(persisted); store.readEvents.mockClear();
     usage = await import('../src/main/session/usage.js');
     expect((await usage.usageOverview()).tokens).toBe(256_000);
@@ -413,9 +413,10 @@ describe('model attribution and equivalent cost', () => {
   });
   it('a native user row without evidence clears earlier selection; injected rows neither select nor clear', async () => {
     store.readEvents.mockResolvedValue([message('model-a', 'high'), message('wrong', 'low', 'input:x'), call('a'), message(), call('b')]);
+    // The unproven turn borrows the chat's nearest recorded model, still marked as assumed.
     expect(plain((await usage.usageOverview()).models)).toEqual([
       { model: 'model-a', reasoningEffort: 'high', assumed: false, tokens: 3 },
-      { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 5 }
+      { model: 'model-a', reasoningEffort: 'high', assumed: true, tokens: 5 }
     ]);
   });
   it('direct call model overrides only that call and never inherits a different models effort', async () => {
@@ -431,13 +432,24 @@ describe('model attribution and equivalent cost', () => {
       { model: 'gpt-5.6', reasoningEffort: null, assumed: false, tokens: 2 }
     ]);
   });
-  it('new frontend and unattributed calls cannot inherit the previous model', async () => {
+  it('new frontend and unattributed calls do not inherit the selection, but are assumed to be the session\'s nearest model', async () => {
     store.readEvents.mockResolvedValue([message('model-a', 'high'), call('a'), call('b', { conversationId: 'other' }), call('c', { conversationId: null })]);
     const result = await usage.usageOverview();
     expect(plain(result.models)).toEqual([
       { model: 'model-a', reasoningEffort: 'high', assumed: false, tokens: 2 },
-      { model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: 2 }
+      { model: 'model-a', reasoningEffort: 'high', assumed: true, tokens: 2 }
     ]);
+  });
+  it('prefers the same chat\'s nearest recorded model, and keeps the GPT-5.6 assumption only when a session recorded none', async () => {
+    store.readEvents.mockResolvedValue([
+      call('a', { conversationId: 'one', model: 'model-a', reasoningEffort: 'high' }),
+      call('b', { conversationId: 'two', model: 'model-b', reasoningEffort: 'low' }),
+      call('c', { conversationId: 'one' })
+    ]);
+    expect(plain((await usage.usageOverview()).models).find(row => row.assumed)).toMatchObject({ model: 'model-a', reasoningEffort: 'high' });
+    store.listUsageSessions.mockResolvedValue([{ id: 'one', updatedAt: 3, events: 3, estimatedTokens: 3 }]);
+    store.readEvents.mockResolvedValue([call('a'), call('b')]);
+    expect(plain((await usage.usageOverview()).models)).toEqual([{ model: 'gpt-5.6', reasoningEffort: 'high', assumed: true, tokens: expect.any(Number) }]);
   });
   it('keeps effort changes for the same model separate and late evidence invalidates the saved revision', async () => {
     store.readEvents.mockResolvedValue([message('model-a', 'high'), call('a'), message('model-a', 'low'), call('b')]);
