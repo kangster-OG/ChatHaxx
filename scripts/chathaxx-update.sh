@@ -50,6 +50,10 @@ else
     git diff --name-only --diff-filter=U
     exit 10
   fi
+fi
+
+# Also covers a re-run after a hand-resolved merge: main has the tag but origin does not yet.
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
   step "check"
   run npm-ci npm ci --no-audit --no-fund
   run typecheck npm run typecheck
