@@ -1,3 +1,5 @@
+import { DEFAULT_CHAT_PERSONALITY, DEFAULT_CHAT_WRITING_STYLE } from '../shared/chat-style.js';
+import { sendCheckUrl } from '../shared/send-check.js';
 import { applyPhonePush, initPhonePushSettings, readPhonePush } from './phone-push-settings.js';
 import { initBrowserSetup } from './setup-browser.js';
 import { currentLanguage, ui, uiText, t, tn, initLanguage, onLanguageChange, setLanguage, type Language } from './i18n.js';
@@ -19,17 +21,23 @@ import { initUsage, refreshOtherApps, refreshUsage } from './usage.js';
 import { initSidebarResize } from './sidebar-resize.js';
 import { initAppShortcuts } from './app-shortcuts.js';
 import { initViewMenu } from './view-menu.js';
+import { initShortcutsDialog, shortcutGroups } from './shortcuts-dialog.js';
 import { initPlugins, applyPluginsState } from './plugins.js';
 import { initBrowserPreferences } from './browser-preferences.js';
 import { initSetupGuide } from './setup-guide.js';
 import { initAppearance } from './appearance.js';
 import { initKeychainNotice } from './keychain-notice.js';
+import { initDesktopAskNotice } from './desktop-ask-notice.js';
 import { initPet } from './pet.js';
 import { initPets } from './pets.js';
 import { initSkillsLibrary } from './skills-library.js';
 import { initWhatsNew } from './whats-new.js';
-import { initSettingsSearch } from './settings-search.js';
-import type { AppearanceSettings } from '../shared/appearance.js';
+import { initTour } from './tour.js';
+import { playSoundCue } from './sound-cues.js';
+import { inQuietHours } from '../shared/phone-push.js';
+import { collectSettings, initSettingsSearch, searchSettings } from './settings-search.js';
+import { matchesWords } from './palette.js';
+import type { AppearanceSettings, ThemeChoice } from '../shared/appearance.js';
 import type { BrowserBridgePort } from '../shared/browser-bridge.js';
 import { parseCommandAllowlistText } from '../shared/command-allowlist.js';
 /**
@@ -61,8 +69,8 @@ import {
   WRITE_CAPABILITIES
 } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
-import { $, ago, disclosureChevron, el, icon, run, shortAgo, toast } from './dom.js';
-import { chatApply, chatSettingsPatch, chatVisible, initChat, openChatSearch, openChatView } from './chat.js';
+import { $, ago, disclosureChevron, el, elapsedDurationText, icon, run, shortAgo, toast } from './dom.js';
+import { chatApply, chatSettingsPatch, chatVisible, initChat, openChatSearch, openChatView, openFeedback } from './chat.js';
 import { publishStopNoticeTexts } from './stop-notices.js';
 import { publishMainTexts } from './main-texts.js';
 import { paintSharedTunnel } from './tunnel-warning.js';
@@ -76,6 +84,7 @@ declare global {
 const api = window.api;
 // First: main announces a Keychain read before it starts and may not get through again until it ends.
 initKeychainNotice(api);
+initDesktopAskNotice(api);
 initLanguage();
 initLayoutPreviews();
 // Composer key hints name this computer's keys only: a Windows user never reads ⌘ first.
@@ -196,12 +205,16 @@ let applying = false;
  * field still follows persisted state normally.
  */
 function applyValue(control: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, next: string, previous?: string): void {
-  const dirty = document.activeElement === control && previous !== undefined && control.value !== previous;
+  const dirty = (document.activeElement === control || requestedSettings !== null) && previous !== undefined && control.value !== previous;
   if (!dirty) control.value = next;
 }
 
+/**
+ * Like applyValue for a switch. A change also stays while a save is pending, focused or not: an
+ * older state push must not reset it, or the next save reads the reset value back (#1443 review).
+ */
 function applyChecked(control: HTMLInputElement, next: boolean, previous?: boolean): void {
-  const dirty = document.activeElement === control && previous !== undefined && control.checked !== previous;
+  const dirty = (document.activeElement === control || requestedSettings !== null) && previous !== undefined && control.checked !== previous;
   if (!dirty) control.checked = next;
 }
 /** The one expanded permission group, or null. One at a time keeps the layout still. */
@@ -245,7 +258,10 @@ function placePermissions(tab: string): void {
   if (permissionSurface.parentElement !== target) target.append(permissionSurface);
 }
 
+/** Set once the tour exists (below); leaving the chat screen ends a running tour quietly. */
+let stopTour: () => void = () => undefined;
 function showTab(name: string): void {
+  if (name !== 'chat') stopTour();
   if (name === 'skills') openSkillsLibrary();
   placePermissions(name);
   const library = name === 'plugins' || name === 'skills' || name === 'pets';
@@ -522,6 +538,51 @@ function readCommandAllowlist(): SettingsPatch['commandAllowlist'] | null {
   };
 }
 
+/**
+ * #1804 (Haz's review): whether a desktop step asks before it takes the real mouse or keyboard,
+ * right under the permission to control them. Off by default; the app's browser steps never ask.
+ */
+function desktopAskRow(): HTMLElement {
+  const row = el('label', 'tool desktop-ask-row');
+  const body = el('span');
+  body.append(el('strong', '', () => t('Ask before using the mouse and keyboard')),
+    el('em', '', () => t("A small question in the screen's corner, with Go ahead and Not now. Go ahead lets that chat continue for up to 2 minutes, until you use the mouse or keyboard again; a step the app can't match to a chat asks again. Browser steps never ask.")));
+  const select = document.createElement('select');
+  select.id = 'desktopAsk';
+  const choices: Array<[string, () => string]> = [['off', () => t('Off')], ['active', () => t("Ask while I'm using the computer")], ['always', () => t('Always ask')]];
+  for (const [value, label] of choices) {
+    const option = document.createElement('option');
+    option.value = value;
+    ui(option, 'textContent', label);
+    select.append(option);
+  }
+  select.addEventListener('change', async () => {
+    const chosen = select.value;
+    if (await save()) return;
+    // Refused (an invalid field elsewhere): show what is saved, unless a newer choice is already on its way.
+    if (select.value === chosen) select.value = requestedSettings?.ui.desktopAsk ?? state?.config.ui.desktopAsk ?? 'off';
+  });
+  row.append(body, select);
+  return row;
+}
+
+/**
+ * Desktop control for a call the app can't tie to a chat (2026-10-30): off unless chosen, because
+ * with one ChatGPT account on several computers such a call can come from another computer's chat.
+ */
+function desktopUnattributedRow(): HTMLElement {
+  const row = el('label', 'tool desktop-unattributed-row');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.id = 'desktopUnattributed';
+  input.addEventListener('change', () => void save());
+  const body = el('span');
+  body.append(el('strong', '', () => t('Allow desktop control from calls without a known chat')),
+    el('em', '', () => t("Normally the screen, mouse and keyboard are used only for a chat the app can name. With one ChatGPT account on several computers, a call it can't name may come from another computer's chat.")));
+  row.append(input, body);
+  return row;
+}
+
 function buildGroups(): void {
   const permissionGroups = GROUPS.map((group) => {
     const box = document.createElement('input');
@@ -548,6 +609,7 @@ function buildGroups(): void {
       body.append(el('strong', '', () => t(CAPABILITY_LABELS[cap])), el('em', '', () => t(CAPABILITY_DETAILS[cap])));
       label.append(input, body);
       tools.append(label);
+      if (cap === 'control') tools.append(desktopAskRow(), desktopUnattributedRow());
     }
     tools.append(toolNames([]));
     if (group.id === 'run') tools.append(buildCommandAllowlist());
@@ -710,7 +772,7 @@ let settingsSaveQueue: Promise<void> = Promise.resolve();
 let requestedSettings: SettingsPatch | null = null;
 
 /** Resolves true once main saved the form, false when nothing was saved (an invalid field, a refusal). */
-function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?: AppearanceSettings } = {}): Promise<boolean> {
+function save(over: { readOnly?: boolean; theme?: ThemeChoice; appearance?: AppearanceSettings } = {}): Promise<boolean> {
   if (applying || !state) return Promise.resolve(false);
 
   const previous: AppState['config'] = requestedSettings
@@ -751,6 +813,8 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       defaultChatReasoning: ($<HTMLSelectElement>('defaultChatReasoning').value || undefined) as Config['ui']['defaultChatReasoning'],
       chatBrowser: $<HTMLSelectElement>('chatBrowser').value as ChatBrowser,
       cosBrowserMinimize: $<HTMLSelectElement>('cosBrowserMinimize').value === 'tray' ? 'tray' : 'taskbar',
+      desktopAsk: ($<HTMLSelectElement>('desktopAsk').value || 'off') as NonNullable<Config['ui']['desktopAsk']>,
+      desktopUnattributed: $<HTMLInputElement>('desktopUnattributed').checked,
       finishTool: $<HTMLInputElement>('finishTool').checked,
       finishHoldOnStop: $<HTMLInputElement>('finishHoldOnStop').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
@@ -769,6 +833,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       autoConnect: $<HTMLInputElement>('autoConnect').checked,
       startAtLogin: $<HTMLInputElement>('startAtLogin').checked,
       turnNotifications: $<HTMLInputElement>('turnNotifications').checked,
+      sounds: $<HTMLInputElement>('soundCues').checked,
       localAppUsage: $<HTMLInputElement>('localAppUsage').checked,
       keepAwake: $<HTMLSelectElement>('keepAwake').value !== 'off',
       keepScreenAwake: $<HTMLSelectElement>('keepAwake').value === 'screen',
@@ -778,7 +843,11 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       playfulContinue: $<HTMLInputElement>('playfulContinue').checked,
       announceTurns: $<HTMLInputElement>('announceTurns').checked,
       customContinue: $<HTMLTextAreaElement>('customContinue').value.trim() || undefined,
+      chatPersonality: chatStyleDraft('chatPersonality', DEFAULT_CHAT_PERSONALITY),
+      chatWritingStyle: chatStyleDraft('chatWritingStyle', DEFAULT_CHAT_WRITING_STYLE),
+      sendCheckUrl: sendCheckDraft(previous),
       followOutput: $<HTMLInputElement>('followOutput').checked,
+      showMessageTimes: $<HTMLInputElement>('showMessageTimes').checked,
       mentionCore: $<HTMLInputElement>('mentionCore').checked,
       mentionPlugins: $<HTMLInputElement>('mentionPlugins').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
@@ -788,6 +857,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       appearance: over.appearance ?? previous.ui.appearance
     },
     controlApi: { enabled: $<HTMLInputElement>('controlApiEnabled').checked, allowActions: $<HTMLInputElement>('controlApiAllowActions').checked },
+    projects: { codeCheckpoints: $<HTMLInputElement>('codeCheckpoints').checked },
     ...chatPatch,
     // After the chat patch, which still carries the stored mcp settings it no longer edits.
     mcp: { instructions: previous.mcp?.instructions ?? '', persistentUrls: $<HTMLInputElement>('mcpPersistentUrls').checked }
@@ -824,6 +894,7 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     compaction: previous.compaction,
     mcp: previous.mcp ?? { instructions: '', persistentUrls: false },
     controlApi: previous.controlApi ?? { enabled: false, allowActions: false },
+    projects: previous.projects ?? { codeCheckpoints: false },
     multiAgent: previous.multiAgent,
     goal: previous.goal
   };
@@ -855,6 +926,18 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     }
     if (state && (!requestedSettings || requestedSettings.controlApi?.enabled === patch.controlApi?.enabled)) {
       $<HTMLInputElement>('controlApiEnabled').checked = state.config.controlApi?.enabled === true;
+    }
+    // And for desktop control without a known chat (CodeRabbit on #1938): a box shown off while the
+    // saved value is still on would misstate what the desktop tools allow.
+    if (state && (!requestedSettings || requestedSettings.ui.desktopUnattributed === patch.ui.desktopUnattributed)) {
+      $<HTMLInputElement>('desktopUnattributed').checked = state.config.ui.desktopUnattributed === true;
+    }
+    // And message times: a switch left on after a failed save would show what the setting hides.
+    if (state && (!requestedSettings || requestedSettings.ui.showMessageTimes === patch.ui.showMessageTimes)) {
+      $<HTMLInputElement>('showMessageTimes').checked = state.config.ui.showMessageTimes === true;
+    }
+    if (state && (!requestedSettings || requestedSettings.projects?.codeCheckpoints === patch.projects?.codeCheckpoints)) {
+      $<HTMLInputElement>('codeCheckpoints').checked = state.config.projects?.codeCheckpoints === true;
     }
     // And the secrets shield: an unticked switch left by a refused save must not turn it off later.
     if (state && (!requestedSettings || requestedSettings.ui.secretsShield === patch.ui.secretsShield)) {
@@ -890,11 +973,9 @@ const METHOD_HINT: Record<string, string> = {
   manual: "This app only listens on localhost. You are responsible for exposing it."
 };
 
+/** Tunnel uptime: "45s", "4m 5s", "6h 12m", "3d 4h", never hundreds of hours. */
 function duration(seconds: number | null): string {
-  if (seconds === null) return '—';
-  if (seconds < 90) return `${Math.round(seconds)}s`;
-  const minutes = Math.round(seconds / 60);
-  return minutes < 90 ? `${minutes}m` : `${Math.round(minutes / 60)}h`;
+  return seconds === null ? '—' : elapsedDurationText(seconds, 2);
 }
 
 /**
@@ -1041,6 +1122,25 @@ function connectorSuffixValid(): string | null {
   input.setAttribute('aria-invalid', String(!valid));
   $('connectorSuffixError').hidden = valid;
   return valid ? value : null;
+}
+/** #1856: the built-in text is saved as absent, so a later release's wording reaches it; empty leaves the part out. */
+function chatStyleDraft(id: 'chatPersonality' | 'chatWritingStyle', fallback: string): string | undefined {
+  const value = $<HTMLTextAreaElement>(id).value.trim();
+  return value === fallback.trim() ? undefined : value;
+}
+/** #1794: the send check's address as typed, '' when empty (off), or null when not on this computer. */
+function sendCheckValid(): string | null {
+  const input = $<HTMLInputElement>('sendCheckUrl');
+  const value = input.value.trim();
+  const valid = value === '' ? '' : sendCheckUrl(value);
+  input.setAttribute('aria-invalid', String(valid === null));
+  $('sendCheckUrlError').hidden = valid !== null;
+  return valid;
+}
+/** An address that is not on this computer is never saved; the saved one stays until it is fixed. */
+function sendCheckDraft(previous: Config): string | undefined {
+  const valid = sendCheckValid();
+  return valid === null ? previous.ui.sendCheckUrl : valid || undefined;
 }
 function connectorSuffixDraft(previous: Config): string {
   return connectorSuffixValid() ?? previous.connectorSuffix ?? '';
@@ -1682,6 +1782,11 @@ function apply(next: AppState): void {
   applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
   applyValue($<HTMLSelectElement>('chatBrowser'), config.ui.chatBrowser ?? 'chrome', previousState?.config.ui.chatBrowser ?? 'chrome');
   applyValue($<HTMLSelectElement>('cosBrowserMinimize'), config.ui.cosBrowserMinimize ?? 'taskbar', previousState?.config.ui.cosBrowserMinimize ?? 'taskbar');
+  applyValue($<HTMLSelectElement>('desktopAsk'), config.ui.desktopAsk ?? 'off', previousState?.config.ui.desktopAsk ?? 'off');
+  applyChecked($<HTMLInputElement>('desktopUnattributed'), config.ui.desktopUnattributed === true, previousState?.config.ui.desktopUnattributed === true);
+  // The system says when it was last used only on macOS and Windows; elsewhere nothing would ask.
+  ($('desktopAsk').closest('.desktop-ask-row') as HTMLElement).hidden = !['macos', 'windows'].includes(next.platform?.family ?? 'macos');
+  ($('desktopUnattributed').closest('.desktop-unattributed-row') as HTMLElement).hidden = !['macos', 'windows'].includes(next.platform?.family ?? 'macos');
   // Only the built-in browser has a window of the app's own to minimize.
   $('cosBrowserMinimizeRow').hidden = (config.ui.chatBrowser ?? 'chrome') !== 'cos';
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
@@ -1720,6 +1825,7 @@ function apply(next: AppState): void {
   $<HTMLInputElement>('startAtLogin').disabled = next.loginStartupAvailable !== true;
   applyChecked($<HTMLInputElement>('startAtLogin'), config.ui.startAtLogin === true, previousState?.config.ui.startAtLogin);
   applyChecked($<HTMLInputElement>('turnNotifications'), config.ui.turnNotifications !== false, previousState ? previousState.config.ui.turnNotifications !== false : undefined);
+  applyChecked($<HTMLInputElement>('soundCues'), config.ui.sounds === true, previousState?.config.ui.sounds);
   applyChecked($<HTMLInputElement>('localAppUsage'), config.ui.localAppUsage !== false, previousState ? previousState.config.ui.localAppUsage !== false : undefined);
   // The saved switch, not the click, decides what the main process reads.
   if (previousState && (previousState.config.ui.localAppUsage !== false) !== (config.ui.localAppUsage !== false)) void refreshOtherApps(true);
@@ -1731,10 +1837,28 @@ function apply(next: AppState): void {
   applyChecked($<HTMLInputElement>('playfulContinue'), config.ui.playfulContinue === true, previousState?.config.ui.playfulContinue);
   applyChecked($<HTMLInputElement>('announceTurns'), config.ui.announceTurns === true, previousState?.config.ui.announceTurns);
   applyValue($<HTMLTextAreaElement>('customContinue'), config.ui.customContinue ?? '', previousState ? previousState.config.ui.customContinue ?? '' : undefined);
+  applyValue($<HTMLTextAreaElement>('chatPersonality'), config.ui.chatPersonality ?? DEFAULT_CHAT_PERSONALITY, previousState ? previousState.config.ui.chatPersonality ?? DEFAULT_CHAT_PERSONALITY : undefined);
+  applyValue($<HTMLTextAreaElement>('chatWritingStyle'), config.ui.chatWritingStyle ?? DEFAULT_CHAT_WRITING_STYLE, previousState ? previousState.config.ui.chatWritingStyle ?? DEFAULT_CHAT_WRITING_STYLE : undefined);
+  // What new chats get, as saved: the built-in text, the person's own, or nothing (Haz on #1859).
+  for (const [id, saved] of [['chatPersonality', config.ui.chatPersonality], ['chatWritingStyle', config.ui.chatWritingStyle]] as const) {
+    ui($(`${id}State`), 'textContent', () => saved === undefined ? t('New chats use the built-in text.')
+      : saved === '' ? t('Saved. New chats leave this part out.') : t('Saved. New chats use your text.'));
+  }
+  // An address that is not on this computer is never saved, so it stays in the field with its
+  // error until the person fixes it; the error always matches what the field holds.
+  const sendCheckField = $<HTMLInputElement>('sendCheckUrl');
+  const typed = sendCheckField.value.trim();
+  if (typed === '' || sendCheckUrl(typed) !== null)
+    applyValue(sendCheckField, config.ui.sendCheckUrl ?? '', previousState ? previousState.config.ui.sendCheckUrl ?? '' : undefined);
+  sendCheckValid();
   applyChecked($<HTMLInputElement>('followOutput'), config.ui.followOutput !== false, previousState?.config.ui.followOutput);
+  applyChecked($<HTMLInputElement>('showMessageTimes'), config.ui.showMessageTimes === true, previousState?.config.ui.showMessageTimes === true);
+  // Every chat row carries its time; the stylesheet shows it above each message only while this is on.
+  document.documentElement.classList.toggle('show-message-times', config.ui.showMessageTimes === true);
   applyChecked($<HTMLInputElement>('mentionCore'), config.ui.mentionCore !== false, previousState?.config.ui.mentionCore);
   applyChecked($<HTMLInputElement>('mentionPlugins'), config.ui.mentionPlugins === true, previousState?.config.ui.mentionPlugins);
   applyChecked($<HTMLInputElement>('controlApiEnabled'), config.controlApi?.enabled === true, previousState?.config.controlApi?.enabled);
+  applyChecked($<HTMLInputElement>('codeCheckpoints'), config.projects?.codeCheckpoints === true, previousState?.config.projects?.codeCheckpoints);
   applyChecked($<HTMLInputElement>('mcpPersistentUrls'), config.mcp?.persistentUrls === true, previousState?.config.mcp?.persistentUrls);
   // Stable URLs live only in the OS-backed secret store; without it they keep rotating.
   $<HTMLInputElement>('mcpPersistentUrls').disabled = next.secureStorage?.available === false && config.mcp?.persistentUrls !== true;
@@ -2389,10 +2513,14 @@ function atBottom(view: HTMLElement): boolean {
   return view.scrollTop + view.clientHeight >= view.scrollHeight - 24;
 }
 
-/** Puts a feed back on its newest line. Safe on a hidden panel: it is re-applied on show. */
+/**
+ * Puts a feed back on its newest line. Only on screen: reading the scroll height lays the page out,
+ * and the app logs every few seconds, so a closed page waits until showTab re-applies it on show.
+ */
 function stickToNewest(id: string): void {
   if (pinned.get(id) === false) return;
   const view = $(id);
+  if (!view.closest('.panel')?.classList.contains('is-active')) return;
   view.scrollTop = view.scrollHeight;
 }
 
@@ -2727,7 +2855,29 @@ $('updateInstall').addEventListener('click', installUpdate);
 $('installUpdate').addEventListener('click', installUpdate);
 $('connectionPopoverToggle').addEventListener('click', () => void toggleConnection());
 $('wizConnect').addEventListener('click', () => void toggleConnection());
-$('readyStart').addEventListener('click', () => showTab('chat'));
+// #1833: Setup's last step offers the first-run tour once; Settings replays it.
+// The answer counts in this window at once, before the saved setting comes back in a state push.
+let tourAnswered = false;
+const tour = initTour({ markDone: async () => {
+  tourAnswered = true;
+  const reply = await api.markTourDone().catch(() => null);
+  if (reply?.ok) return true;
+  toast(t("The tour choice couldn't be saved, so it may be offered again."));
+  return false;
+} });
+// A replay from Settings starts on the next frame; leaving chat before it cancels it too (CodeRabbit).
+let tourFrame = 0;
+stopTour = () => { if (tourFrame) cancelAnimationFrame(tourFrame); tourFrame = 0; tour.stop(); };
+$('readyStart').addEventListener('click', () => {
+  showTab('chat');
+  if (state && state.config.ui.tourDone !== true && !tourAnswered) tour.offer();
+});
+$('takeTour').addEventListener('click', () => {
+  showTab('chat');
+  // After the chat view has laid out, so each step finds its control on screen.
+  if (tourFrame) cancelAnimationFrame(tourFrame);
+  tourFrame = requestAnimationFrame(() => { tourFrame = 0; tour.start(); });
+});
 $('showCosBrowser').addEventListener('click', event => void run(
   (event.currentTarget as HTMLElement).dataset.signedIn === 'true' ? api.signOutChatGpt() : api.showCosBrowser()));
 /** Setup's browser choice is the same save as choosing it in Settings, so both share one rule. */
@@ -2767,6 +2917,7 @@ async function saveDiagnosticsReport(): Promise<void> {
   }
 }
 for (const button of diagnosticsButtons) button.addEventListener('click', () => void saveDiagnosticsReport());
+$('sendFeedback').addEventListener('click', () => openFeedback());
 
 $('copyLogJson').addEventListener('click', async () => {
   const text = await run(api.getLogJson());
@@ -2835,13 +2986,16 @@ for (const id of [
   'playfulContinue',
   'announceTurns',
   'followOutput',
+  'showMessageTimes',
   'followUp',
   'enterSends',
   'turnNotifications',
+  'soundCues',
   'mentionCore',
   'mentionPlugins',
   'controlApiEnabled',
   'controlApiAllowActions',
+  'codeCheckpoints',
   'mcpPersistentUrls',
   'privacyScreenshots',
   'phonePushEnabled',
@@ -2857,11 +3011,19 @@ for (const id of [
   'tunnelKind',
   'tunnelId',
   'desktopTunnelId',
-  'connectorSuffix'
+  'connectorSuffix',
+  'sendCheckUrl'
 ]) {
   $(id).addEventListener('change', () => void save());
 }
+$('sendCheckUrl').addEventListener('input', () => { sendCheckValid(); });
 $('connectorSuffix').addEventListener('input', () => { connectorSuffixValid(); });
+// #1802: turning sounds on plays one, so the person hears what they chose.
+// Switching sounds on plays a sample, unless it is the quiet hours the switch promises to follow.
+$('soundCues').addEventListener('change', event => {
+  if ((event.target as HTMLInputElement).checked && !inQuietHours(state?.config.ui.phonePush?.quietHours ?? null, new Date())) playSoundCue('finished');
+});
+api.onSoundCue?.(playSoundCue);
 
 document.addEventListener('click', (event) => {
   const target = event.target as HTMLElement;
@@ -2897,6 +3059,7 @@ async function refresh(): Promise<void> {
 
 buildGroups();
 initSidebarResize();
+const shortcutsDialog = initShortcutsDialog({ enterSends: () => state?.config.ui.enterSends !== false });
 initAppShortcuts({
   newChat: $('newChat'),
   settings: $('workspaceSettings'),
@@ -2904,6 +3067,7 @@ initAppShortcuts({
 });
 const viewMenu = initViewMenu({
   search: openChatSearch,
+  shortcuts: shortcutsDialog.open,
   cosBrowser: () => state?.config.ui.chatBrowser === 'cos',
   showCosBrowser: () => void run(api.showCosBrowser()),
   pets: { toggle: () => pet.toggle(), visible: () => pet.isVisible() },
@@ -2914,7 +3078,22 @@ initPlugins(apply);
 initPets(api, pet);
 openSkillsLibrary = initSkillsLibrary(api);
 initBrowserPreferences();
-initChat({ save: async () => { await save(); }, state: () => state });
+initChat({ save: () => save(), state: () => state, palette: {
+  showChat: () => showTab('chat'),
+  actions: () => [
+    { label: () => t('Keyboard shortcuts'), keys: () => paletteKeys('Keyboard shortcuts'), run: () => shortcutsDialog.open() },
+    { label: () => t('Settings'), keys: () => paletteKeys('Settings'), run: () => $('workspaceSettings').click() }
+  ],
+  // By the setting's own name only, word by word: a match in a description or a page name, or an
+  // explanatory sentence the page shows in a setting's place, reads as noise next to chats.
+  settings: query => searchSettings(collectSettings(document), query)
+    .filter(entry => !/[.!?…]$/.test(entry.title) && matchesWords(entry.title, query))
+    .map(entry => ({ title: entry.title, place: [entry.page, entry.section].filter(Boolean).join(' › '), open: () => settingsSearch.reveal(entry) }))
+} });
+/** The keys the shortcuts dialog prints for one of its rows, by its English name. */
+function paletteKeys(name: string): string[] {
+  return shortcutGroups(() => state?.config.ui.enterSends !== false).flatMap(group => group.rows).find(row => row.label() === t(name))?.keys() ?? [];
+}
 
 void (async () => {
   await refresh();

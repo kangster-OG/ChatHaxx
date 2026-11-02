@@ -509,6 +509,12 @@
   "content_goal_wait_tool_inactivity": {
     "message": "Aguardando as ferramentas ficarem inativas"
   },
+  "content_goal_reviewer_deadline": {
+    "message": "Continua sem a revisão em $1"
+  },
+  "content_goal_wait_reviewer": {
+    "message": "Aguardando o revisor"
+  },
   "content_goal_wait_workers": {
     "message": "Aguardando os subagentes deste chat"
   },
@@ -727,6 +733,9 @@
   },
   "content_turn_stop_requested": {
     "message": "A interrupção foi solicitada; a página não mostra mais geração."
+  },
+  "content_turn_stop_unseen": {
+    "message": "Interrompido aqui: o ChatGPT não mostrava mais esta resposta em andamento."
   },
   "content_unknown_error": {
     "message": "erro desconhecido"
@@ -983,6 +992,9 @@
   "popup_pipeline_waiting_first_message": {
     "message": "Aguardando a primeira mensagem."
   },
+  "popup_pipeline_not_a_chat": {
+    "message": "Esta página do ChatGPT não é um chat, então o app não tem nada para acompanhar aqui. Abra ou inicie um chat."
+  },
   "popup_pipeline_waiting_latest_request_id": {
     "message": "Chat registrado. Aguardando o ID da solicitação do turno mais recente."
   },
@@ -1051,6 +1063,9 @@
   },
   "popup_status_new_chat": {
     "message": "novo chat"
+  },
+  "popup_status_not_a_chat": {
+    "message": "não é um chat"
   },
   "popup_status_none_open": {
     "message": "nenhum aberto"

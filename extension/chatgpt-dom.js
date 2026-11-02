@@ -1774,6 +1774,13 @@ var CLF_DOM = (() => {
    * recording "Chat On Steroids Desktop is now connected" as a ChatGPT failure.
    */
   const acknowledgedAccessNotices = new WeakSet();
+  // The last access-limit notice read, kept past its acknowledgement: one read and closed while the
+  // model picker ran is still the reason a delivery stopped (CodeRabbit on #1900).
+  let lastAccessNotice = null;
+  /** The access-limit notice read at or after `since` (ms), or '' when none was. */
+  function accessNoticeSince(since) {
+    return lastAccessNotice && lastAccessNotice.at >= since ? lastAccessNotice.text : '';
+  }
   function errors() {
     return safe(() => {
       const out = [];
@@ -1790,6 +1797,7 @@ var CLF_DOM = (() => {
         if (value.length >= 500 || (!english && !korean)) continue;
         const notice = value.startsWith(headingText) ? `${headingText} ${value.slice(headingText.length).trim()}` : value;
         out.push({ text: notice, node, turnId: null, recoverable: false, blocking: true });
+        lastAccessNotice = { text: notice, at: Date.now() };
         texts.add(value);
         // Acknowledge this identified informational notice once. The returned
         // blocking diagnostic survives the click; it grants no retry authority.
@@ -2779,10 +2787,12 @@ var CLF_DOM = (() => {
       const actions = [...tileParent.querySelectorAll('button')];
       if (actions.length === 2 && actions[1] === button) {
         const open = actions[0], name = open.getAttribute('aria-label');
-        const removal = button.getAttribute('aria-label') || '';
+        const removal = (button.getAttribute('aria-label') || '').trim();
         const labelled = [...tileParent.querySelectorAll('span')].some(node =>
           !node.children.length && node.textContent === name);
-        if (name && removal !== name && removal.endsWith(` ${name}`) && labelled &&
+        // The tile's structure is the proof, not the remove label's wording: "Remove notes.zip" in
+        // English, "notes.zip entfernen" in German (#1942), and a label naming no file at all.
+        if (name && removal && removal !== name.trim() && labelled &&
             open.closest('[data-composer-attachments]') === attachmentHost) return name;
       }
     }
@@ -3175,16 +3185,19 @@ var CLF_DOM = (() => {
         const data = event.data;
         if (event.source !== window || event.origin !== location.origin || data?.source !== 'clf-picker-reply' || data.nonce !== nonce || data.v !== 1) return;
         const state = data.picker;
-        const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._ -]+$/u.test(value) && value.trim() === value && value.trim();
+        const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._: -]+$/u.test(value) && value.trim() === value && value.trim();
         const valid = state && typeof state.version === 'string' && Number.isInteger(state.currentBucket) &&
-          Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 20 &&
+          Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 48 &&
           state.versions.every(v => groupId(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
-          Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 12 &&
+          Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 48 &&
           state.choices.every(c => Number.isInteger(c.bucket) && typeof c.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.id) && typeof c.label === 'string' && c.label.length > 0 && c.label.length <= 80 &&
             groupId(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
             ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(c.effort) && typeof c.available === 'boolean') &&
           new Set(state.versions.map(v => v.id)).size === state.versions.length && new Set(state.choices.map(c => c.bucket)).size === state.choices.length &&
           state.versions.some(v => v.id === state.version) && state.choices.some(c => c.bucket === state.currentBucket);
+        // The slider's order is only a navigation aid: one that does not hold every readable lane is dropped, not trusted.
+        if (valid && state.lanes !== undefined && !(Array.isArray(state.lanes) && state.lanes.length <= 48 && state.lanes.every(Number.isInteger) &&
+          new Set(state.lanes).size === state.lanes.length && state.choices.every(c => state.lanes.includes(c.bucket)))) delete state.lanes;
         finish(valid ? state : null);
       };
       const timer = setTimeout(() => finish(null), 1500);
@@ -3326,14 +3339,26 @@ var CLF_DOM = (() => {
       },
       async bucket(bucket) {
         let current = await state();
-        for (let count = 0; current && count < 12; count++) {
+        const press = direction => {
+          const controls = [...(picker()?.querySelectorAll('[role="menuitem"][aria-keyshortcuts]') || [])].filter(node => shown(node) && node.getAttribute('aria-keyshortcuts').includes('ArrowRight'));
+          return controls.length === 1 && key(controls[0], direction);
+        };
+        for (let count = 0; current && count < 48; count++) {
           if (current.currentBucket === bucket) return current;
-          const from = current.choices.findIndex(c => c.bucket === current.currentBucket), to = current.choices.findIndex(c => c.bucket === bucket);
+          // The slider moves through every native lane, also those the reader skipped (#1905).
+          const order = current.lanes ?? current.choices.map(c => c.bucket);
+          const from = order.indexOf(current.currentBucket), to = order.indexOf(bucket);
           if (from < 0 || to < 0) return null;
-          const expected = current.choices[from + (to > from ? 1 : -1)].bucket;
-          const controls = [...picker().querySelectorAll('[role="menuitem"][aria-keyshortcuts]')].filter(node => shown(node) && node.getAttribute('aria-keyshortcuts').includes('ArrowRight'));
-          if (controls.length !== 1 || !key(controls[0], to > from ? 'ArrowRight' : 'ArrowLeft')) return null;
-          const version = current.version;
+          const step = to > from ? 1 : -1, direction = step > 0 ? 'ArrowRight' : 'ArrowLeft';
+          let at = from + step;
+          if (!press(direction)) return null;
+          // On a lane it cannot read the picker reads as nothing: that proves the move, and the
+          // next key goes on toward a lane it can read. Nothing is selected on the way.
+          while (at !== to && !current.choices.some(c => c.bucket === order[at])) {
+            if (!await wait(async () => !await readPickerState()) || !press(direction)) return null;
+            at += step;
+          }
+          const version = current.version, expected = order[at];
           current = await state(next => next.version === version && next.currentBucket === expected);
         }
         return null;
@@ -3665,15 +3690,16 @@ var CLF_DOM = (() => {
   }
 
   /**
-   * ChatGPT's own "new Project" control in its sidebar, or null.
-   *
-   * Located by the attribute ChatGPT's sidebar action carries, not by its label, which is in the
-   * account's language (measured 2026-10-10: `data-app-action-sidebar-project-create`, labelled
-   * "Adicionar novo projeto" on a pt-BR account). Exactly one shown control, or nothing.
+   * ChatGPT's native Project creation control, independent of the account's language.
+   * The Projects index now owns Create (2026-10-19). Older layouts put the action in the sidebar.
+   * Only an unambiguous visible control in the matching surface is eligible.
    */
   function projectCreateControl() {
     return safe(() => {
-      const shown = [...document.querySelectorAll('button[data-app-action-sidebar-project-create]')]
+      const selector = location.pathname === '/projects' && document.querySelector('#projects-index-search')
+        ? '[data-chatgpt-project-conversation-drop-target] > button[type="button"][data-color="primary"][data-variant="solid"]'
+        : 'button[data-app-action-sidebar-project-create]';
+      const shown = [...document.querySelectorAll(selector)]
         .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 && !node.disabled);
       return shown.length === 1 ? shown[0] : null;
     }, null);
@@ -3697,6 +3723,61 @@ var CLF_DOM = (() => {
   function projectIdsShown() {
     return safe(() => [...new Set([...document.querySelectorAll('a[href]')]
       .map(link => projectHomeId(new URL(link.href, location.href).pathname)).filter(Boolean))], []);
+  }
+
+  /**
+   * The Projects ChatGPT's sidebar lists right now, in its order (#1756). Each Project row carries
+   * its id and label as attributes, collapsed or not (measured 2026-10-21:
+   * `data-app-action-sidebar-project-id`, `-label`); an expanded one also links to its home, which
+   * older pages only have. A collapsed sidebar lists none, which says nothing about the account.
+   */
+  function projectsShown() {
+    return safe(() => {
+      const out = [];
+      const add = (rawId, rawName) => {
+        const id = String(rawId || '').toLowerCase();
+        const name = String(rawName || '').split('\n').map(part => part.trim()).find(Boolean) || '';
+        if (/^g-p-[0-9a-f]{32}$/.test(id) && name && !out.some(project => project.id === id) && out.length < 200) out.push({ id, name: name.slice(0, 200) });
+      };
+      for (const row of document.querySelectorAll('[data-app-action-sidebar-project-id]')) {
+        add(row.getAttribute('data-app-action-sidebar-project-id'), row.getAttribute('data-app-action-sidebar-project-label'));
+      }
+      for (const link of document.querySelectorAll('nav a[href], aside a[href]')) {
+        add(projectHomeId(new URL(link.href, location.href).pathname), link.innerText || link.textContent);
+      }
+      return out;
+    }, []);
+  }
+
+  /**
+   * ChatGPT's own announcements over a page. On 2026-10-30 one ("Premium seats just got better")
+   * covered a new chat: Compact & Resume found no message box and gave up, and a worker could not
+   * choose its model. Closed here: a modal dialog this extension did not open, that is not the
+   * access-limit notice `errors()` reads, and that has nothing to type into, so a Settings dialog,
+   * a form or the model picker is never touched. Closed only by Escape, the way a person dismisses
+   * it: no button in it is pressed, so nothing is chosen. Returns the headings it closed.
+   */
+  async function dismissAnnouncements(stillCurrent = () => true, waitMs = 1500) {
+    const notices = new Set(errors().map(error => error.node));
+    const open = () => safe(() => [...document.querySelectorAll('[role="dialog"]')].filter(node =>
+      !node.closest(OWN_SURFACES) && !node.closest('[hidden],[inert],[aria-hidden="true"]') && node.getClientRects().length > 0 &&
+      node.getAttribute('data-state') !== 'closed' && !notices.has(node) &&
+      !node.querySelector('[data-testid="composer-intelligence-picker-content"]') &&
+      !node.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, select, ' +
+        '[contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="searchbox"]')), []);
+    const closed = [];
+    for (const dialog of open()) {
+      if (!stillCurrent()) break;
+      const heading = ((dialog.querySelector('h1,h2,h3,[role="heading"]')?.textContent || dialog.getAttribute('aria-label') || '')
+        .replace(/\s+/g, ' ').trim()).slice(0, 80);
+      dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+      const until = Date.now() + waitMs;
+      while (dialog.isConnected && dialog.getClientRects().length > 0 && Date.now() < until) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (!dialog.isConnected || dialog.getClientRects().length === 0) closed.push(heading);
+    }
+    return closed;
   }
 
   /** ChatGPT's open "Create project" dialog: its name field and its one submit button. */
@@ -3770,6 +3851,7 @@ var CLF_DOM = (() => {
     projectCreateForm,
     revealSidebar,
     projectIdsShown,
+    projectsShown,
     fillProjectName,
     projectHomeId,
     sidebarListsProject,
@@ -3856,6 +3938,8 @@ var CLF_DOM = (() => {
     thoughtActivityRows,
     toolLabel,
     errors,
+    dismissAnnouncements,
+    accessNoticeSince,
     composer,
     composerSubmitReady,
     clearRevivalResidue,

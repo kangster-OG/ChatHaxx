@@ -9,6 +9,124 @@ The app and the browser extension in `extension/` are versioned together. **Relo
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.49] — Long chats that get through ChatGPT's limits, and message times
+
+Long chats no longer stop when ChatGPT briefly limits a chat's history or the app is busy with other chats, and ChatGPT's own pop-ups no longer block your messages. You can also show the time of each message.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself once no chat is busy.
+
+### ✨ New
+
+- **Message times.** **Settings → General → Show message times** shows a small time above each message. Point at it for the full date. It is off unless you turn it on.
+
+### 💪 Better
+
+- **The log says why a message waits.** When a ChatGPT page holds a queued message back, the app log now says why: an answer or a tool still running, a covered message box, or a question the page can't read.
+- **A quieter log with Firefox.** Firefox's add-on reconnects every half minute while idle. That is now one summary line an hour instead of two lines each time.
+- **The bundled OpenAI tunnel client** is updated to v0.0.19.
+
+### 🛠 Fixed
+
+- **Long chats that ChatGPT limits.** In a very long chat, ChatGPT sometimes says it "temporarily limited access to this conversation history". The app then reloaded the chat to recover, and every reload loaded the whole history again, so the limit went on and the chat stopped until you sent a message yourself. The app now waits longer each time ChatGPT limits the same chat (2, 4, 8, then 15 minutes) and does not reload it while it waits. Your queued message is sent once the limit is over.
+- **Recovery that gave up on an open chat.** During busy runs with sub-agents, the app could decide that a chat had "no page" and stop recovering it, although its ChatGPT tab was open and asking. It now keeps recovering a chat while its page asks, and the log says why a recovery step had to wait.
+- **ChatGPT's pop-ups no longer block messages.** When ChatGPT showed an announcement over the page (for example about new plans), a new chat could not start, a model could not be chosen, and Compact & Resume gave up. The app now closes such an announcement before it uses the page. It never closes a dialog you are typing in, and the log says which one it closed.
+- **Only your own chats use your mouse and keyboard.** With one ChatGPT account on two computers, ChatGPT can send a chat's tool call to the other computer's app. A chat from the other computer could then take a screenshot of this one and move its pointer. Desktop control now runs only for a chat this app can name. If you really need it for calls it cannot name, **Settings → Workspace → Permissions**, under **Control mouse and keyboard**, has a separate switch, off by default.
+- **Files in German ChatGPT.** With ChatGPT in German, an attached file was never recognized as uploaded, so the message waited until "upload not confirmed". It is now recognized in every language.
+
+### Thank you
+
+To **@scuan2** for finding why recovery gave up on open chats during busy runs, and to **@diegogarciarojo** for the report on attachments that never sent.
+
+## [2.1.48] — A reviewer for Goal steps, a theme that follows your system, and a question before the mouse and keyboard
+
+Goal can have a second chat check each step's file changes. The theme can follow your computer's light or dark mode, and the app can ask before a chat uses your mouse and keyboard. Ages read in days, weeks, months and years, tool rows speak your language, and sending recovers by itself in more situations.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself once no chat is busy, now also while a message waits in the queue.
+
+### ✨ New
+
+- **Goal step reviewer.** Settings → Agents & automation → Review each Goal step's changes. While Goal runs, a reviewer worker reads what each step changed with the edit tools, and its findings go into the next step's message. A finding that starts with "BLOCKING:" pauses Goal and tells you why. It needs Sub-agents turned on, uses more of your ChatGPT usage, and is off by default.
+- **Same as system theme.** Settings → Appearance → Theme → Same as system follows your Mac's or Windows' light or dark mode, also when it switches while the app is open.
+- **Ask before using the mouse and keyboard.** On Home, under the permission to control the mouse and keyboard: Off (the default), Ask while I'm using the computer, or Always ask. A small question in the screen's corner asks before a step takes your mouse or keyboard, and never takes the focus; Go ahead lets that chat go on for up to 2 minutes, until you use the mouse or keyboard yourself. The same question also waits in the app's window, so you can answer it by keyboard.
+- **⌘K finds actions and settings.** While you type in ⌘K / Ctrl+K, a few matching actions (New chat, Find in chat, Terminal, Review …) and settings show under the chats.
+- **Jump between your messages.** Alt+↑ and Alt+↓ (⌥ on Mac) go to your previous and next message in a chat.
+
+### 💪 Better
+
+- **Ages read naturally.** The chat list says "2w", "3mo" or "1y" instead of "389h ago", in your language. Worker run times, background processes, tunnel uptime and countdowns follow the same rule: "3d 4h" or "2:05:30", never hundreds of hours or minutes.
+- **Diagnostics reports** say more about "Activity not attributed": where ChatGPT's page showed a request the app could not match.
+- **Tool rows in your language.** "Read", "Edited", "Ran", counts and times in a chat's tool rows are shown in your language, also in older chats.
+- **Dropping files** outlines the message box while you drag, and says the files will be attached.
+
+### 🛠 Fixed
+
+- **Sending into an existing chat** works again when ChatGPT's model menu lists every model of your account. It used to fail with "model unconfirmed".
+- **Adding a folder creates its ChatGPT Project again** on ChatGPT's new Projects page.
+- **The browser extension's self-update** no longer waits forever behind a message that only waits in the queue.
+- **A message you send just as you close the chat's tab** is sent instead of expiring.
+- **A chat tab that opened while you were offline** recovers by itself once you're back online, instead of every message to that chat expiring.
+- **The Quote button** no longer covers the Copy and Download buttons under a short answer.
+- **Goal and Loop with providers that don't support JSON schemas** (such as DeepSeek) work: the app falls back to a format the provider accepts instead of retrying the same refused request.
+- **A chat that recovered by itself** is no longer reloaded again by a late report about its old, failed turn.
+- **Diagnostics reports** no longer garble ordinary words such as "worker" when a project or chat has a short name like "Work".
+- **Workers in their own Git worktrees** start from a linked checkout whose repository is in another approved folder, and come back after a restart.
+- **Goal no longer waits for good** after a step whose progress note ChatGPT showed only once the step had finished.
+- **Ctrl+K / ⌘K** no longer opens chat search on top of another open window, such as What's New.
+- **A long task continued in fresh turns** no longer repeats the earlier turns' sentences in each later turn.
+
+
+## [2.1.47] — Scheduled runs, changed files under each answer, commit and pull request from Review, and your own chat style
+
+A chat can send itself a message on a schedule. Each answer that edited files shows what changed. Review can commit, push and open a pull request. And you can rewrite how ChatGPT talks and writes in new chats.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself once no chat is busy.
+
+### ✨ New
+
+- **Scheduled runs.** A chat can send a message by itself on a schedule: every few hours, daily, on weekdays or weekly (chat menu ⋯ → Schedule…). Times missed while the app was closed are skipped unless you turn on catching up.
+- **Changed files under each answer.** An answer that edited files shows a short "Changed files" line. Open it to see each file's changes, or go to Review.
+- **Commit and pull request from Review.** Choose the files, edit the suggested message, and optionally push and open a pull request.
+- **Code checkpoints.** Review can compare with an automatic checkpoint taken before each turn's first edit, and restore files from it.
+- **Your own chat style.** Settings → Agents & automation → Chat instructions lets you rewrite the Personality and Writing style of new chats, or leave either out. Tools and permissions stay as they are.
+- **Link an existing ChatGPT Project.** When you add a folder, you can link it to a ChatGPT Project you already have. Change or unlink it later from the project's menu.
+- **Share a chat as a web page.** Chat menu → Share as web page (or /share). You see the page before saving. Keys are always hidden, and email addresses and user names are hidden unless you choose to show them.
+- **Sub-agents at a glance.** The Sub-agents dock shows one line per worker: what it is doing, its answer, or that it waits for you in ChatGPT.
+- **Quote from a reply.** Select words in a chat message and click Quote to add them to your message.
+- **Keyboard shortcuts.** Ctrl+/ (⌘/ on macOS) shows every shortcut, also under View → Keyboard shortcuts.
+- **Sounds.** Optional short sounds when a chat needs you, something fails, or a chat finishes in the background.
+- **Send feedback from the app.** Activity → Send feedback (or /feedback) opens GitHub's form with your text, version and system filled in.
+- **A short tour after Setup.** One minute: the composer's modes, projects and Review. Take it again from Settings → General.
+- **For developers: check automatic sends.** A program on your computer can be asked before each message the app sends by itself, and can hold it (Settings → General → For developers).
+
+### 💪 Better
+
+- **Less disk space for chat recordings:** screenshots are stored about half the size, with exactly the same image.
+- **Less CPU while the app sits idle.**
+- **Diagnostics reports** say how long the app took to start, beside your earlier starts.
+- **Cards and charts in replies** stay readable when you look at them later in the app.
+- **Tool calls in a chat that runs in the background** show up in that chat more reliably, instead of under "Activity not attributed".
+- **When OpenAI doesn't know a tunnel ID,** the app says so, and the health check also tests the Plugins and Desktop tunnels.
+
+### 🛠 Fixed
+
+- **The Plugins connection can be turned off** in Plugin setup when you don't use it, so its warning goes away.
+- **The Plugins connector** can be added to ChatGPT again when a plugin declares a preview widget.
+- **Tool calls whose request id differs in one digit** are now matched to their chat.
+- **A switch you change in Settings** no longer flips back while it is being saved.
+- **Chats in the sidebar** show one tooltip, not two.
+- **On a ChatGPT page that isn't a chat** (such as a Dot), the extension popup says so instead of waiting.
+- **While ChatGPT waits for you to approve a tool,** the app no longer reloads that chat under the approval card; the chat says it waits for the card instead.
+- **A finished Goal** still says "Goal reached" after the app restarts, instead of "Pursuing goal".
+- **A chat whose answer ChatGPT stopped showing** (for example while ChatGPT limits loading its history) now offers Stop, so your next message can go out.
+- **A new file in Review and in the edit cards** no longer shows an empty extra line under its content.
+- **With Goal response source set to Offline,** Goal again recognizes its continue or complete marker in answers that used tools.
+
 ## [2.1.46] — Phone notifications, a settings backup, keys kept from ChatGPT, and high contrast
 
 Get a note on your phone when a chat needs you, move your settings to another computer, and keep API keys and tokens out of what ChatGPT sees. Appearance gains high contrast, accent colors, line spacing and a more legible font.

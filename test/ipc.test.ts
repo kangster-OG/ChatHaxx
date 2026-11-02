@@ -105,7 +105,7 @@ it('keeps the reported interface language and the extension preferences through 
   expect(getConfig().ui.browserPreferences).toEqual({ overwrite: false, durations: true });
 });
 
-it.each(['playfulStatus', 'playfulContinue', 'followOutput', 'announceTurns'] as const)('saves the %s display switch from Settings', async key => {
+it.each(['playfulStatus', 'playfulContinue', 'followOutput', 'announceTurns', 'showMessageTimes'] as const)('saves the %s display switch from Settings', async key => {
   // Both are plain ui booleans saved by the general Settings save. The save schema dropped keys
   // it did not list, so a switch that was not listed reverted on the next state push.
   const base = getConfig();
@@ -117,6 +117,72 @@ it.each(['playfulStatus', 'playfulContinue', 'followOutput', 'announceTurns'] as
   expect(getConfig().ui[key]).toBe(wanted);
 });
 
+// CodeRabbit on #1948: a form from before the switch existed sends it off without an edit; that is not
+// turning it off.
+it('keeps Show message times on through a stale save whose form sends the switch off without an edit', async () => {
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, showMessageTimes: true } }, base)).toMatchObject({ ok: true });
+  const now = getConfig();
+  const { showMessageTimes: _, ...older } = now.ui;
+  const stale = { ...now, ui: older };
+  expect(await save({ ...stale, ui: { ...older, showMessageTimes: false, theme: now.ui.theme === 'light' ? 'dark' : 'light' } }, stale)).toMatchObject({ ok: true });
+  expect(getConfig().ui.showMessageTimes).toBe(true);
+});
+
+it('saves the ask-before-mouse-and-keyboard choice (#1804), keeps it through a stale save, and refuses an unknown one', async () => {
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, desktopAsk: 'always' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.desktopAsk).toBe('always');
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.desktopAsk).toBe('always');
+  const now = getConfig();
+  expect(await save({ ...now, ui: { ...now.ui, desktopAsk: 'sometimes' } }, now)).toMatchObject({ ok: false });
+  expect(getConfig().ui.desktopAsk).toBe('always');
+  // CodeRabbit: a stale snapshot from before the choice existed (none saved) and the form's default
+  // (off) are the same choice, not an edit: the live Always ask stays.
+  const { desktopAsk: _, ...older } = now.ui;
+  const stale = { ...now, ui: older };
+  expect(await save({ ...stale, ui: { ...older, desktopAsk: 'off' } }, stale)).toMatchObject({ ok: true });
+  expect(getConfig().ui.desktopAsk).toBe('always');
+});
+
+it('saves desktop control for calls without a known chat, off by default, and keeps it through a stale save (2026-10-30)', async () => {
+  const base = getConfig();
+  expect(base.ui.desktopUnattributed).toBeUndefined();
+  expect(await save({ ...base, ui: { ...base.ui, desktopUnattributed: true } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.desktopUnattributed).toBe(true);
+  // A stale form without the field, or with the form's default (off), is not an edit: it stays on.
+  const now = getConfig();
+  const { desktopUnattributed: _, ...older } = now.ui;
+  const stale = { ...now, ui: older };
+  expect(await save({ ...stale, ui: { ...older, desktopUnattributed: false, theme: now.ui.theme === 'light' ? 'dark' : 'light' } }, stale)).toMatchObject({ ok: true });
+  expect(getConfig().ui.desktopUnattributed).toBe(true);
+  const latest = getConfig();
+  expect(await save({ ...latest, ui: { ...latest.ui, desktopUnattributed: false } }, latest)).toMatchObject({ ok: true });
+  expect(getConfig().ui.desktopUnattributed).toBe(false);
+});
+
+it('remembers that the first-run tour was taken or declined, through any later settings save (#1833)', async () => {
+  expect(getConfig().ui.tourDone).toBeUndefined();
+  await handlers.get('ui:tourDone')!(null, undefined);
+  expect(getConfig().ui.tourDone).toBe(true);
+  // The Settings form does not own it; a save that changes something else keeps it.
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, tourDone: false, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.tourDone).toBe(true);
+});
+
+it('saves Play sounds through Settings, off by default, and keeps it across a stale unrelated save (#1802)', async () => {
+  const base = getConfig();
+  expect(base.ui.sounds).toBe(false);
+  expect(await save({ ...base, ui: { ...base.ui, sounds: true } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.sounds).toBe(true);
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.sounds).toBe(true);
+  expect(await save({ ...getConfig(), ui: { ...getConfig().ui, sounds: false } }, getConfig())).toMatchObject({ ok: true });
+  expect(getConfig().ui.sounds).toBe(false);
+});
+
 it('saves Auto-select Skills through Settings and preserves it across a stale unrelated save', async () => {
   const base = getConfig();
   const wanted = !(base.ui.autoSelectSkills ?? false);
@@ -124,6 +190,21 @@ it('saves Auto-select Skills through Settings and preserves it across a stale un
   expect(getConfig().ui.autoSelectSkills).toBe(wanted);
   expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
   expect(getConfig().ui.autoSelectSkills).toBe(wanted);
+});
+
+it('saves the Code checkpoints switch through Settings, preserves it across a stale unrelated save and keeps it when omitted', async () => {
+  const base = getConfig();
+  expect(base.projects.codeCheckpoints).toBe(false);
+  expect(await save({ ...base, projects: { codeCheckpoints: true } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().projects.codeCheckpoints).toBe(true);
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().projects.codeCheckpoints).toBe(true);
+  const { projects: _omitted, ...withoutProjects } = getConfig();
+  expect(await save(withoutProjects as never, withoutProjects as never)).toMatchObject({ ok: true });
+  expect(getConfig().projects.codeCheckpoints).toBe(true);
+  const live = getConfig();
+  expect(await save({ ...live, projects: { codeCheckpoints: false } }, live)).toMatchObject({ ok: true });
+  expect(getConfig().projects.codeCheckpoints).toBe(false);
 });
 
 it('saves the Continue prompt from Settings, keeps it through a stale save, and clears it when emptied', async () => {
@@ -136,6 +217,31 @@ it('saves the Continue prompt from Settings, keeps it through a stale save, and 
   expect(await save({ ...saved, ui: { ...saved.ui, customContinue: 'x'.repeat(501) } }, saved)).toMatchObject({ ok: false });
   expect(await save({ ...saved, ui: { ...saved.ui, customContinue: '   ' } }, saved)).toMatchObject({ ok: true });
   expect(getConfig().ui.customContinue).toBeUndefined();
+});
+
+it('saves Personality and Writing style from Settings: own text, emptied, and back to default (#1856)', async () => {
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, chatPersonality: '  Be brief.  ', chatWritingStyle: '' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui).toMatchObject({ chatPersonality: 'Be brief.', chatWritingStyle: '' });
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui).toMatchObject({ chatPersonality: 'Be brief.', chatWritingStyle: '' });
+  const saved = getConfig();
+  expect(await save({ ...saved, ui: { ...saved.ui, chatPersonality: 'x'.repeat(8001) } }, saved)).toMatchObject({ ok: false });
+  expect(await save({ ...saved, ui: { ...saved.ui, chatPersonality: undefined, chatWritingStyle: undefined } }, saved)).toMatchObject({ ok: true });
+  expect(getConfig().ui.chatPersonality).toBeUndefined();
+  expect(getConfig().ui.chatWritingStyle).toBeUndefined();
+});
+
+it('saves the send check address from Settings, keeps it through a stale save, and clears it when emptied (#1794)', async () => {
+  const base = getConfig();
+  expect(await save({ ...base, ui: { ...base.ui, sendCheckUrl: ' http://127.0.0.1:8091/check ' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.sendCheckUrl).toBe('http://127.0.0.1:8091/check');
+  expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+  expect(getConfig().ui.sendCheckUrl).toBe('http://127.0.0.1:8091/check');
+  const saved = getConfig();
+  expect(await save({ ...saved, ui: { ...saved.ui, sendCheckUrl: 'x'.repeat(301) } }, saved)).toMatchObject({ ok: false });
+  expect(await save({ ...saved, ui: { ...saved.ui, sendCheckUrl: undefined } }, saved)).toMatchObject({ ok: true });
+  expect(getConfig().ui.sendCheckUrl).toBeUndefined();
 });
 
 it('names a chat with one clean line, and clears the name for an empty one (#1107)', async () => {
@@ -151,6 +257,59 @@ it('names a chat with one clean line, and clears the name for an empty one (#110
   expect((await getSession(session.id))?.title).toBe('From ChatGPT');
   expect(await rename(42)).toMatchObject({ ok: false });
   expect(await handlers.get('sessions:rename')!(null, { id: 'missing-session-0001', title: 'x' })).toMatchObject({ ok: false, error: expect.stringContaining('Session not found') });
+});
+
+it('saves, reads, pauses and removes a chat\'s schedule, and refuses one that cannot run (#1826)', async () => {
+  const session = await createSession({ conversationId: 'ipc-schedule-chat', title: 'Scheduled' });
+  const call = (name: string, payload: unknown) => handlers.get(name)!(null, payload) as Promise<any>;
+  expect(await call('schedules:get', { sessionId: session.id })).toEqual({ ok: true, data: null });
+  const saved = await call('schedules:save', { sessionId: session.id, text: '  Check the issues  ', repeat: { kind: 'weekdays', at: '09:00' }, until: null });
+  expect(saved).toMatchObject({ ok: true, data: { sessionId: session.id, text: 'Check the issues', repeat: { kind: 'weekdays', at: '09:00' }, paused: false } });
+  expect(await call('schedules:get', { sessionId: session.id })).toMatchObject({ ok: true, data: { id: saved.data.id } });
+  expect(await call('schedules:pause', { sessionId: session.id, paused: true })).toMatchObject({ ok: true, data: { paused: true } });
+  // Catching up missed runs is chosen in the dialog; left out, it is off.
+  expect(await call('schedules:save', { sessionId: session.id, text: 'Daily', repeat: { kind: 'daily', at: '09:00' }, until: null, catchUp: true })).toMatchObject({ ok: true, data: { catchUp: true } });
+  expect(await call('schedules:save', { sessionId: session.id, text: 'x', repeat: { kind: 'hours', every: 0 }, until: null })).toMatchObject({ ok: false });
+  expect(await call('schedules:save', { sessionId: session.id, text: 'x', repeat: { kind: 'daily', at: '25:00' }, until: null })).toMatchObject({ ok: false });
+  expect(await call('schedules:save', { sessionId: 'missing-session-0001', text: 'x', repeat: { kind: 'daily', at: '09:00' }, until: null }))
+    .toEqual({ ok: false, error: 'This chat no longer exists.' });
+  expect(await call('schedules:delete', { sessionId: session.id })).toEqual({ ok: true, data: true });
+  expect(await call('schedules:get', { sessionId: session.id })).toEqual({ ok: true, data: null });
+});
+
+it('answers a turn\'s changed files and refuses a malformed request (#1827)', async () => {
+  const session = await createSession({ conversationId: 'ipc-turn-changes', title: 'Changes' });
+  const call = (name: string, payload: unknown) => handlers.get(name)!(null, payload) as Promise<any>;
+  expect(await call('sessions:turnChanges', { sessionId: session.id, turnId: 'no-edits', from: 0 })).toEqual({ ok: true, data: { changes: [], total: 0 } });
+  expect(await call('sessions:turnFileDiff', { sessionId: session.id, turnId: 'no-edits', from: 0, path: 'a.ts' })).toEqual({ ok: true, data: null });
+  expect(await call('sessions:turnChanges', { sessionId: '../escape', turnId: 'x', from: 0 })).toMatchObject({ ok: false });
+  expect(await call('sessions:turnChanges', { sessionId: session.id, turnId: 'x', from: -1 })).toMatchObject({ ok: false });
+});
+
+it('reads a turn\'s edits once for its card and its files, again after the chat changes, and logs a refused request (CodeRabbit)', async () => {
+  const session = await createSession({ conversationId: 'ipc-turn-changes-reuse', title: 'Changes' });
+  const call = (name: string, payload: unknown) => handlers.get(name)!(null, payload) as Promise<any>;
+  const store = await import('../src/main/session/store.js');
+  const logger = await import('../src/main/logger.js');
+  const reads = vi.spyOn(store, 'readEvents');
+  const warn = vi.spyOn(logger, 'logWarn');
+  try {
+    const request = { sessionId: session.id, turnId: 'reused', from: 0 };
+    await call('sessions:turnChanges', request);
+    await call('sessions:turnFileDiff', { ...request, path: 'a.ts' });
+    await call('sessions:turnFileDiff', { ...request, path: 'b.ts' });
+    expect(reads.mock.calls.filter(([id]) => id === session.id)).toHaveLength(1);
+    const { notifyChanged } = await import('../src/main/session/recorder.js');
+    notifyChanged(session.id);
+    // Change notices are batched for 400 ms.
+    await new Promise(resolve => setTimeout(resolve, 600));
+    await call('sessions:turnChanges', request);
+    expect(reads.mock.calls.filter(([id]) => id === session.id)).toHaveLength(2);
+    expect(await call('sessions:turnChanges', { sessionId: session.id, turnId: 'x', from: -1 })).toMatchObject({ ok: false });
+    expect(warn).toHaveBeenCalledWith('ipc: sessions:turnChanges refused: invalid_payload');
+    expect(await call('sessions:turnFileDiff', { sessionId: session.id, turnId: 'x', from: 0 })).toMatchObject({ ok: false });
+    expect(warn).toHaveBeenCalledWith('ipc: sessions:turnFileDiff refused: invalid_payload');
+  } finally { reads.mockRestore(); warn.mockRestore(); }
 });
 
 it('enabling strict chat allowlisting keeps existing chats untrusted', async () => {
@@ -560,6 +719,31 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   expect(await handlers.get('sessions:toolEditReview')!(null, {
     sessionId: first.data.id, callId: 'not-a-uuid', changeIndex: 0
   })).toMatchObject({ ok: false });
+});
+
+it('adds a folder whose ChatGPT Project the person picks next, and links or creates it (#1756)', async () => {
+  currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send: vi.fn() } };
+  const folder = path.join(dir, 'link-project');
+  await fs.mkdir(path.join(folder, 'other'), { recursive: true });
+  await saveConfig({ ...defaultConfig(), roots: [] });
+  await writeDurableNow('projects', []);
+  const { noteChatgptProjects } = await import('../src/main/chatgpt-project-catalog.js');
+  const listed = `g-p-${'e'.repeat(32)}`;
+  await noteChatgptProjects([{ id: listed, name: 'Existing' }]);
+  vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: false, filePaths: [folder] });
+  const later = await handlers.get('projects:add')!(null, { chatgpt: 'later' }) as any;
+  expect(later.ok, later.error).toBe(true);
+  expect(later.data.chatgpt).toBeUndefined();
+  expect(await handlers.get('projects:add')!(null, { chatgpt: 'now' })).toMatchObject({ ok: false });
+  expect((await handlers.get('projects:chatgpt-choices')!(null, {}) as any).data).toEqual([{ id: listed, name: 'Existing', linkedTo: null }]);
+  expect(await handlers.get('projects:chatgpt-link')!(null, { id: later.data.id, chatgptId: 'g-p-x' })).toMatchObject({ ok: false });
+  const linked = await handlers.get('projects:chatgpt-link')!(null, { id: later.data.id, chatgptId: listed }) as any;
+  expect(linked).toMatchObject({ ok: true, data: { chatgpt: { state: 'linked', id: listed } } });
+  expect((await handlers.get('projects:chatgpt-choices')!(null, {}) as any).data[0].linkedTo).toEqual({ id: later.data.id, name: 'link-project' });
+  vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: false, filePaths: [path.join(folder, 'other')] });
+  const second = await handlers.get('projects:add')!(null, { chatgpt: 'later' }) as any;
+  const created = await handlers.get('projects:chatgpt-create')!(null, { id: second.data.id }) as any;
+  expect(created).toMatchObject({ ok: true, data: { chatgpt: { state: 'requested' } } });
 });
 
 it('does not install a stale Git watch after a newer Files project watch', async () => {
@@ -1101,6 +1285,18 @@ describe('settings writes from more than one UI', () => {
     expect(getConfig().ui.tabsToKeepOpen).toBe(6);
     expect(getConfig().goal).toMatchObject({ helperModel: 'account-helper', helperReasoning: 'medium', model: base.goal.model });
   });
+  it('saves the Goal step reviewer choice, keeps it through a stale unrelated save, and refuses a bad one (#1832)', async () => {
+    const base = defaultConfig();
+    await saveConfig(base);
+    expect((await save({ ...base, goal: { ...base.goal, reviewerModel: 'same' } }, base)).ok).toBe(true);
+    expect(getConfig().goal.reviewerModel).toBe('same');
+    // A form painted before that save does not carry the field back to off.
+    expect((await save({ ...base, ui: { ...base.ui, tabsToKeepOpen: 5 } }, base)).ok).toBe(true);
+    expect(getConfig().goal.reviewerModel).toBe('same');
+    const now = getConfig();
+    expect((await save({ ...now, goal: { ...now.goal, reviewerModel: 'y'.repeat(200) } }, now)).ok).toBe(false);
+    expect(getConfig().goal.reviewerModel).toBe('same');
+  });
   it('saves the secrets shield switch, and keeps it when a form without it saves (#1797)', async () => {
     const base = defaultConfig();
     await saveConfig(base);
@@ -1150,6 +1346,21 @@ describe('settings writes from more than one UI', () => {
     expect(getConfig().ui.planBackend).toBe('chatgpt');
     expect((await save({ ...current, ui: { ...current.ui, planBackend: 'unsupported' } }, current)).ok).toBe(false);
     expect(getConfig().ui.planBackend).toBe('chatgpt');
+  });
+  // #1914: System is saved as the choice; the window shows the theme the system has now.
+  it('saves System and paints the window in the system\'s theme', async () => {
+    currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send: vi.fn() } };
+    const base = { ...defaultConfig(), ui: { ...defaultConfig().ui, theme: 'light' as const } };
+    await saveConfig(base);
+    (nativeTheme as any).shouldUseDarkColors = true;
+    try {
+      const reply = await save({ ...base, ui: { ...base.ui, theme: 'system' as const } }, base);
+      expect(reply.ok, reply.error).toBe(true);
+      expect(getConfig().ui.theme).toBe('system');
+      expect(nativeTheme.themeSource).toBe('system');
+      expect(currentWindow.setBackgroundColor).toHaveBeenLastCalledWith('#181818');
+      expect((await save({ ...getConfig(), ui: { ...getConfig().ui, theme: 'sepia' as never } }, getConfig())).ok).toBe(false);
+    } finally { delete (nativeTheme as any).shouldUseDarkColors; }
   });
   it('does not let a stale renderer snapshot undo a newer extension setting', async () => {
     currentWindow = {
@@ -1307,6 +1518,76 @@ describe('root namespace invariants', () => {
 });
 
 /** Exercise the real IPC policy for both Settings buttons and authored chat links. */
+describe('Commit & PR', () => {
+  it('remembers how far Commit goes, and keeps it through a settings save', async () => {
+    expect(await handlers.get('projectCommit:flow')!(null, { flow: 'pr' })).toEqual({ ok: true, data: true });
+    expect(getConfig().ui.commitFlow).toBe('pr');
+    expect(((await handlers.get('projectCommit:flow')!(null, { flow: 'always' })) as { ok: boolean }).ok).toBe(false);
+    expect(getConfig().ui.commitFlow).toBe('pr');
+    // The Settings form does not own it; a save that changes something else carries it through.
+    const base = getConfig();
+    expect(await save({ ...base, ui: { ...base.ui, theme: base.ui.theme === 'light' ? 'dark' : 'light' } }, base)).toMatchObject({ ok: true });
+    expect(getConfig().ui.commitFlow).toBe('pr');
+  });
+
+  // A well-formed request for a project that does not exist reaches the commit and is refused there;
+  // each malformed one must be refused before, for its own field.
+  const wellFormed = { projectId: '6f9619ff-8b86-4d01-b42d-00cf4fc964ff', message: 'x', paths: ['a.ts'], expectedToken: 'a'.repeat(64) };
+  it.each([
+    { expectedToken: 'short' },
+    { paths: ['../outside.ts'] },
+    { paths: ['src/../../outside.ts'] },
+    { paths: ['C:\\Windows\\win.ini'] },
+    { message: 'x'.repeat(10_001) },
+    { amend: true }
+  ])('refuses a commit request before Git runs: %o', async change => {
+    const reached = (await handlers.get('projectCommit:commit')!(null, wellFormed)) as { ok: boolean; error: string };
+    expect(reached.ok).toBe(false);
+    const refused = (await handlers.get('projectCommit:commit')!(null, { ...wellFormed, ...change })) as { ok: boolean; error: string };
+    expect(refused.ok).toBe(false);
+    expect(refused.error).not.toBe(reached.error);
+    if (change.paths) expect(refused.error).toBe('A path must stay inside the project.');
+  });
+
+  it('tells the window the remembered choice at once, so the next Commit opens with it', async () => {
+    currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send: vi.fn() } };
+    try {
+      await handlers.get('projectCommit:flow')!(null, { flow: getConfig().ui.commitFlow === 'commit' ? 'pr' : 'commit' });
+      const sent = vi.mocked(currentWindow.webContents.send).mock.calls.find(([channel]) => channel === 'state:changed');
+      expect((sent?.[1] as { config: { ui: { commitFlow?: string } } } | undefined)?.config.ui.commitFlow).toBe(getConfig().ui.commitFlow);
+    } finally {
+      currentWindow = null;
+    }
+  });
+});
+
+describe('in-app feedback', () => {
+  it("opens GitHub's form filled in, with the app's version, and says nothing was shortened", async () => {
+    vi.mocked(app.getVersion).mockReturnValue('2.1.46');
+    const reply = await handlers.get('feedback:openIssue')!(null, { kind: 'bug', what: 'The Stop button stays grey.', frequency: 'Sometimes' });
+    expect(reply).toEqual({ ok: true, data: { trimmed: false } });
+    const url = new URL(vi.mocked(shell.openExternal).mock.calls.at(-1)![0] as string);
+    expect(url.origin + url.pathname).toBe('https://github.com/totec448-spec/chat-on-steroids/issues/new');
+    expect(url.searchParams.get('template')).toBe('bug_report.yml');
+    expect(url.searchParams.get('version')).toBe('2.1.46');
+    expect(url.searchParams.get('operating_system')).toBeTruthy();
+    expect(url.searchParams.get('frequency')).toBe('Sometimes');
+  });
+
+  it.each([
+    { kind: 'bug', what: '   ' },
+    { kind: 'idea', problem: 'p', proposal: '' },
+    { kind: 'bug', what: 'x', template: 'blank.yml' },
+    { kind: 'bug', what: 'x', frequency: 'Always' },
+    { kind: 'bug', what: 'x'.repeat(4001) },
+    { kind: 'other', what: 'x' }
+  ])('opens nothing for a report the form cannot take: %o', async report => {
+    const before = vi.mocked(shell.openExternal).mock.calls.length;
+    expect(((await handlers.get('feedback:openIssue')!(null, report)) as { ok: boolean }).ok).toBe(false);
+    expect(vi.mocked(shell.openExternal).mock.calls.length).toBe(before);
+  });
+});
+
 describe('every link the window offers', () => {
   it('is one link:open will actually open', async () => {
     const { promises: fs } = await import('node:fs');

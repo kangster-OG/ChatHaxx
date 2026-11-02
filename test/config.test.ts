@@ -1,7 +1,7 @@
 import { REASONING_EFFORTS } from '../src/shared/session.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_GOAL_MODEL,
   defaultConfig,
@@ -126,6 +126,31 @@ describe('settings migration', () => {
       expect(loaded.readOnly).toBe(true);
     }
   });
+  it('loads the sounds switch saved before it existed, or damaged, as off, and keeps everything else', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, ui: { ...config.ui, sounds: true } });
+    expect((await loadConfig()).ui.sounds).toBe(true);
+    const { sounds: _, ...older } = config.ui;
+    for (const ui of [older, { ...older, sounds: 'yes' }, { ...older, sounds: 1 }, { ...older, sounds: null }]) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, readOnly: true, ui: { ...ui, theme: 'light' } }), 'utf8');
+      const loaded = await loadConfig();
+      expect(loaded.ui.sounds).toBe(false);
+      expect(loaded.ui.theme).toBe('light');
+      expect(loaded.readOnly).toBe(true);
+    }
+  });
+  // #1914: Same as system is saved as 'system'; Light and Dark from older versions load as they were,
+  // and a damaged theme loads as the default (Dark) without touching the other saved choices.
+  it('loads the System theme, older Light and Dark as saved, and a damaged theme as Dark', async () => {
+    const config = defaultConfig();
+    for (const [saved, loadedAs] of [['system', 'system'], ['light', 'light'], ['dark', 'dark'], ['sepia', 'dark'], [7, 'dark'], [null, 'dark']] as const) {
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...config, readOnly: true, ui: { ...config.ui, theme: saved, sounds: true } }), 'utf8');
+      const loaded = await loadConfig();
+      expect(loaded.ui.theme).toBe(loadedAs);
+      expect(loaded.ui.sounds).toBe(true);
+      expect(loaded.readOnly).toBe(true);
+    }
+  });
   it('drops removed file-saving settings without changing other saved choices', async () => {
     const config = defaultConfig();
     config.readOnly = true;
@@ -226,6 +251,25 @@ describe('settings migration', () => {
     expect((await loadConfig()).ui.localAppUsage).toBe(true);
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, localAppUsage: false } });
     expect((await loadConfig()).ui.localAppUsage).toBe(false);
+  });
+  it('keeps Code checkpoints off for fresh, legacy and malformed configs while preserving explicit opt-in', async () => {
+    expect(defaultConfig().projects).toEqual({ codeCheckpoints: false });
+    const load = async (projects: unknown) => {
+      const stored = { ...defaultConfig(), readOnly: false } as Record<string, unknown>;
+      if (projects === undefined) delete stored.projects; else stored.projects = projects;
+      await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(stored), 'utf8');
+      return loadConfig();
+    };
+    expect((await load(undefined)).projects).toEqual({ codeCheckpoints: false });
+    expect((await load({})).projects).toEqual({ codeCheckpoints: false });
+    expect((await load({ codeCheckpoints: true })).projects).toEqual({ codeCheckpoints: true });
+    // A bad value repairs to off without sending the rest of the file through (read-only) recovery.
+    const loaded = await load({ codeCheckpoints: 'yes' });
+    expect(loaded.projects).toEqual({ codeCheckpoints: false });
+    expect(loaded.readOnly).toBe(false);
+    expect((await load('on')).projects).toEqual({ codeCheckpoints: false });
+    await saveConfig({ ...defaultConfig(), projects: { codeCheckpoints: true } });
+    expect((await loadConfig()).projects.codeCheckpoints).toBe(true);
   });
   it('keeps the local control API off for fresh, legacy and malformed configs while preserving explicit opt-in', async () => {
     expect(defaultConfig().controlApi).toEqual({ enabled: false, allowActions: false });
@@ -864,6 +908,19 @@ describe('the goal loop settings', () => {
     expect(config.goal.objectivePrompt).toContain('Read it together with the original task');
   });
 
+  it('keeps the Goal step reviewer off by default, and loads a saved or damaged choice safely (#1832)', async () => {
+    expect(defaultConfig().goal.reviewerModel).toBe('');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: 'same' } });
+    expect((await loadConfig()).goal.reviewerModel).toBe('same');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: '  gpt-6-thinking ' } });
+    expect((await loadConfig()).goal.reviewerModel).toBe('gpt-6-thinking');
+    // A value no version wrote (too long, not text) turns the reviewer off rather than failing the file.
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: 'x'.repeat(200) } });
+    const loaded = await loadConfig();
+    expect(loaded.goal.reviewerModel).toBe('');
+    expect(loaded.goal.helperModel).toBe(defaultConfig().goal.helperModel);
+  });
+
   it('moves the exact superseded helper models to GPT-6 and keeps any other choice', async () => {
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, helperModel: 'gpt-5.6-sol', helperReasoning: 'medium' } });
     // GPT-5.6 Sol is no longer in ChatGPT's catalog; the untouched shipped value adopts the current default.
@@ -899,6 +956,7 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-6',
       helperReasoning: 'high',
+      reviewerModel: '',
       enabled: true,
       mode: 'loop',
       provider: { kind: 'openrouter', baseUrl: '' },
@@ -1046,6 +1104,7 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-6',
       helperReasoning: 'high',
+      reviewerModel: '',
       enabled: false,
       mode: 'goal',
       provider: { kind: 'openrouter', baseUrl: '' },
@@ -1214,3 +1273,88 @@ describe('a settings file the app cannot read as is', () => {
     expect(await fs.readFile(path.join(dir, saved[0]!), 'utf8')).toBe(content);
   });
 });
+
+// CodeRabbit on #1864: a damaged ask-before-mouse-and-keyboard choice keeps asking (always) and says so;
+// a missing one is the default, off; a saved one loads as it was.
+it('loads a damaged desktop ask choice as always, a missing one as off, and says so once', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const lines = () => warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('desktopAsk'));
+  for (const [saved, loadedAs] of [['active', 'active'], ['off', 'off'], ['always', 'always'], [undefined, undefined]] as const) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopAsk: saved } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopAsk).toBe(loadedAs);
+    expect(lines()).toEqual([]);
+  }
+  for (const damaged of ['sometimes', 3, null, { off: true }]) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopAsk: damaged } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopAsk).toBe('always');
+    expect(lines()).toEqual(['config: the saved ui.desktopAsk was damaged; the app asks before every desktop step until it is chosen again']);
+  }
+  warn.mockRestore();
+});
+
+// 2026-10-30: desktop control for calls without a known chat. A config from before the setting, or a
+// damaged value, loads as off (the safe side), and only the damaged one is logged.
+it('loads desktop control for calls without a known chat as off when missing or damaged, and logs only the damaged one', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const lines = () => warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('desktopUnattributed'));
+  for (const [saved, loadedAs] of [[true, true], [false, false], [undefined, undefined]] as const) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopUnattributed: saved } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopUnattributed).toBe(loadedAs);
+    expect(lines()).toEqual([]);
+  }
+  for (const damaged of ['yes', 1, null, { on: true }]) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, desktopUnattributed: damaged } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.desktopUnattributed).toBeUndefined();
+    expect(lines()).toEqual(['config: the saved ui.desktopUnattributed was damaged; desktop control is used only for chats the app can name until it is chosen again']);
+  }
+  warn.mockRestore();
+});
+
+// 2026-10-30: "Show message times". A config from before the switch loads as off; a damaged value too,
+// said once.
+it('loads Show message times as off when missing or damaged, and logs only the damaged one', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const lines = () => warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('showMessageTimes'));
+  for (const [saved, loadedAs] of [[true, true], [false, false], [undefined, undefined]] as const) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, showMessageTimes: saved } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.showMessageTimes).toBe(loadedAs);
+    expect(lines()).toEqual([]);
+  }
+  for (const damaged of ['yes', 1, null]) {
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(), ui: { ...defaultConfig().ui, showMessageTimes: damaged } }), 'utf8');
+    warn.mockClear();
+    expect((await loadConfig()).ui.showMessageTimes).toBeUndefined();
+    expect(lines()).toEqual(['config: the saved ui.showMessageTimes was damaged; message times stay hidden until the switch is set again']);
+  }
+  warn.mockRestore();
+});
+
+// #1856 (CodeRabbit): a damaged saved chat style falls back to the built-in text and says so once, never its content.
+it('logs a damaged saved chat style without its text, and nothing for an absent one', async () => {
+  const logger = await import('../src/main/logger.js');
+  const warn = vi.spyOn(logger, 'logWarn');
+  const { MAX_CHAT_STYLE_CHARS } = await import('../src/shared/chat-style.js');
+  // On disk, as a damaged file has it: saveConfig would already drop the value before writing.
+  await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({ ...defaultConfig(),
+    ui: { ...defaultConfig().ui, chatPersonality: 'secret-ish ' + 'x'.repeat(MAX_CHAT_STYLE_CHARS) } }), 'utf8');
+  warn.mockClear();
+  const loaded = await loadConfig();
+  expect(loaded.ui.chatPersonality).toBeUndefined();
+  const lines = warn.mock.calls.map(call => String(call[0])).filter(line => line.includes('chatPersonality'));
+  expect(lines).toEqual(['config: the saved ui.chatPersonality was damaged (too long); new chats use the built-in text']);
+  expect(lines.join()).not.toContain('secret-ish');
+  warn.mockClear();
+  await saveConfig(defaultConfig());
+  await loadConfig();
+  expect(warn.mock.calls.filter(call => String(call[0]).includes('chatPersonality'))).toEqual([]);
+  warn.mockRestore();
+});
+

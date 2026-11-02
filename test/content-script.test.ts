@@ -456,6 +456,33 @@ afterEach(() => {
   live = null;
 });
 
+/**
+ * 2026-10-30: ChatGPT showed an announcement ("Premium seats just got better") over a fresh chat. Its
+ * modal hid the message box, so Compact & Resume gave up and a worker could not choose its model.
+ * The page closes such a dialog by Escape, as a person would, and says which one it closed.
+ */
+function announcement(document: Document, options: { field?: boolean; heading?: string } = {}): HTMLElement {
+  const dialog = document.createElement('div');
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('data-state', 'open');
+  dialog.innerHTML = `<h2>${options.heading ?? 'Premium seats just got better'}</h2><button type="button">Standard</button>` +
+    `<button type="button">Premium</button>${options.field ? '<input type="text" value="">' : ''}`;
+  Object.defineProperty(dialog, 'getClientRects', { value: () => dialog.isConnected ? [{ width: 500, height: 400 }] : [] });
+  const form = document.querySelector('#prompt-textarea')!.closest('form')!;
+  form.setAttribute('aria-hidden', 'true');
+  const close = (event: KeyboardEvent) => {
+    if (event.key !== 'Escape') return;
+    dialog.remove();
+    form.removeAttribute('aria-hidden');
+    document.removeEventListener('keydown', close as EventListener);
+  };
+  // Radix listens for Escape on the document.
+  document.addEventListener('keydown', close as EventListener);
+  document.body.append(dialog);
+  return dialog;
+}
+
 describe('one synchronous page snapshot per observer turn', () => {
   it.each([true, false])('resets a completed idle conversation only through native New Chat (control=%s)', async available => {
     live = await harness(undefined, {}, (document, dom) => {
@@ -2681,6 +2708,224 @@ describe('desktop input delivery and helper ownership', () => {
     if (outcome !== 'ready') expect(live.sent.some(message => message.type === 'desktop_input')).toBe(false);
   });
 
+  it('leaves a dialog with a field to fill alone, so a queued message waits instead of closing what the person uses', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const timer = live.window.setTimeout;
+    let expire!: () => void;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { expire = fn; return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    const dialog = announcement(live.document, { field: true, heading: 'Rename chat' });
+    const sending = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA });
+    await settle(200);
+    expire();
+    expect(await sending).toEqual({ ok: false });
+    expect(dialog.isConnected).toBe(true);
+    // The page says why it held the message back (2026-10-30).
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held')).toEqual([
+      expect.objectContaining({ reason: 'composer-hidden', inputId, conversationId: chatA })
+    ]);
+    expect(live.sent.some(message => message.type === 'page_note' && message.note === 'announcement-closed')).toBe(false);
+  });
+
+  // CodeRabbit on #1947: a tool call that starts while the page waits for its message box is the reason,
+  // not the box.
+  it('says a running tool call holds a queued message, also one that starts during the wait', async () => {
+    let tools = 0;
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: tools } }),
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const timer = live.window.setTimeout;
+    let expire!: () => void;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { expire = fn; return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    live.hook.observe(); await live.hook.pullActivity();
+    announcement(live.document, { field: true, heading: 'Rename chat' });
+    const sending = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA });
+    await settle(200);
+    tools = 1;
+    await live.hook.pullActivity();
+    expire();
+    expect(await sending).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held')).toEqual([
+      expect.objectContaining({ reason: 'tool-running', inputId, conversationId: chatA })
+    ]);
+    // Already running when the next offer arrives: said at once.
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held').map(message => message.reason)).toEqual(['tool-running', 'tool-running']);
+  });
+
+  // CodeRabbit on #1947: a new question on the same chat during the wait is the chat moving on, not
+  // the tab leaving it.
+  it('says the chat moved on when a new question arrives while it waits for the message box', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const timer = live.window.setTimeout;
+    let expire!: () => void;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { expire = fn; return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    live.hook.observe(); await settle();
+    announcement(live.document, { field: true, heading: 'Rename chat' });
+    const sending = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, silenceTurnId: 'quiet-turn' });
+    await settle(200);
+    userTurn(live.document, 'typed-meanwhile', 'A question typed meanwhile');
+    expire();
+    expect(await sending).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held')).toEqual([
+      expect.objectContaining({ reason: 'chat-moved-on', inputId, conversationId: chatA })
+    ]);
+  });
+
+  // CodeRabbit on #1947: a question seen before that is no longer on the page is not a new one.
+  it('says the question it continues is gone when that row leaves the page during the wait', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const timer = live.window.setTimeout;
+    let expire!: () => void;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { expire = fn; return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    const question = userTurn(live.document, 'asked-before', 'The question asked before');
+    live.hook.observe(); await settle();
+    announcement(live.document, { field: true, heading: 'Rename chat' });
+    const sending = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, silenceTurnId: 'quiet-turn' });
+    await settle(200);
+    (question as unknown as HTMLElement).remove();
+    expire();
+    expect(await sending).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held')).toEqual([
+      expect.objectContaining({ reason: 'question-gone', inputId, conversationId: chatA })
+    ]);
+  });
+
+  it('closes no dialog while ChatGPT limits the page\'s history, whatever language its notice is in (CodeRabbit on #1939)', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const timer = live.window.setTimeout;
+    let expire!: () => void;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { expire = fn; return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    const now = Date.now();
+    live.window.dispatchEvent(new live.window.MessageEvent('message', { source: live.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId: chatA, observedAt: now, retryAt: now + 60_000 } }));
+    // The limit notice in a language the page does not recognize by wording.
+    const notice = announcement(live.document, { heading: 'Zu viele Anfragen' });
+    const sending = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA });
+    await settle(200);
+    expire();
+    expect(await sending).toEqual({ ok: false });
+    expect(notice.isConnected).toBe(true);
+    expect(live.sent.some(message => message.type === 'page_note' && message.note === 'announcement-closed')).toBe(false);
+  });
+
+  it('keeps the history-limit hold on the limited chat only (CodeRabbit on #1939)', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    (live.window as any).CLF_DOM.selectModelSettings = vi.fn(async () => true);
+    const now = Date.now();
+    live.window.dispatchEvent(new live.window.MessageEvent('message', { source: live.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId: chatA, observedAt: now, retryAt: now + 60_000 } }));
+    // The tab moves on to another chat; an announcement there is closed as usual.
+    live.dom.reconfigure({ url: `https://chatgpt.com/c/${chatB}` }); live.hook.observe(); await settle();
+    const dialog = announcement(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'other-chat-user', text);
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      live!.hook.observe();
+    });
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatB })).toEqual({ ok: true });
+    expect(dialog.isConnected).toBe(false);
+  });
+
+  it('reports a closed announcement only for the chat it was closed on (CodeRabbit on #1939)', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const dialog = announcement(live.document);
+    // Closing it takes the page to another chat, as ChatGPT can while its animation runs.
+    live.document.addEventListener('keydown', event => { if (event.key === 'Escape') { live!.dom.reconfigure({ url: `https://chatgpt.com/c/${chatB}` }); live!.hook.observe(); } });
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    expect(dialog.isConnected).toBe(false);
+    expect(live.sent.some(message => message.type === 'page_note' && message.note === 'announcement-closed')).toBe(false);
+  });
+
+  // CodeRabbit on #1947: a turn the page still holds while ChatGPT shows no Stop is not "an answer running".
+  it('says the page still holds a turn ChatGPT no longer shows running, apart from a running answer', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, { page_note: () => ({ ok: true }) });
+    startGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    stopGenerating(live.document);
+    live.advance(30_000);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held')).toEqual([
+      expect.objectContaining({ reason: 'turn-held', inputId, conversationId: chatA })
+    ]);
+  });
+
+  // CodeRabbit on #1947: the tab moved to another chat before the offer arrived. That chat's state is
+  // not this message's reason, so nothing is said.
+  it('says nothing about a queued message for a chat this tab no longer shows', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, { page_note: () => ({ ok: true }) });
+    startGenerating(live.document);
+    live.hook.observe(); await settle();
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatB })).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note')).toEqual([]);
+  });
+
+  it('says ChatGPT still shows an answer running when that holds a queued message back (2026-10-30)', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    startGenerating(live.document);
+    live.hook.observe(); await settle();
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note' && message.note === 'input-held')).toEqual([
+      expect.objectContaining({ reason: 'still-answering', inputId, conversationId: chatA })
+    ]);
+  });
+
+  it('closes an announcement over an existing chat so its queued message is sent, not held behind it', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    (live.window as any).CLF_DOM.selectModelSettings = vi.fn(async () => true);
+    announcement(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'announced-input-user', text);
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      live!.hook.observe();
+    });
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: true });
+    expect(live.sent.filter(message => message.type === 'page_note')).toEqual([
+      expect.objectContaining({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chatA })
+    ]);
+  });
+
   it('waits for the normal Stop-to-Send frame after a canonical final without recovering the page', async () => {
     live = await harness(`https://chatgpt.com/c/${chatA}`, {
       desktop_input: message => ({ ok: true, data: message.authorize || message.ack ? { ok: true } : { input: claimed() } })
@@ -2762,7 +3007,31 @@ describe('desktop input delivery and helper ownership', () => {
     const failure = live.sent.find(message => message.type === 'desktop_input' && message.fail);
     expect(failure?.error).toContain('Too many requests');
     expect(failure?.error).toContain('few minutes');
+    // ChatGPT's own limit, not a model the picker rejected: no model code (2.1.47 round).
+    expect(failure?.detail).toBeUndefined();
     expect(live.sent.some(message => message.type === 'desktop_input' && (message.ack || message.authorize))).toBe(false);
+  });
+
+  // CodeRabbit on #1900: errors() acknowledges a limit dialog the first time it reads it, so a dialog
+  // read and closed while the picker ran is gone by the time the failure is classified.
+  it('reports a provider limit that was read and closed during picker confirmation, not a model failure', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.fail ? { ok: true } : { input: claimed({ model: 'gpt-5.6-sol', reasoningEffort: 'high' }) } })
+    });
+    const notice = live.document.createElement('div');
+    notice.setAttribute('role', 'dialog');
+    Object.defineProperty(notice, 'getClientRects', { value: () => [{ width: 400, height: 200 }] });
+    notice.innerHTML = '<h2>Too many requests</h2><p>We have temporarily limited access to conversations to protect your data. Please wait a few minutes.</p>';
+    (live.window as any).CLF_DOM.selectModelSettings = async () => {
+      live!.document.body.append(notice);
+      expect((live!.window as any).CLF_DOM.errors().some((error: any) => error.blocking)).toBe(true);
+      notice.remove();
+      return false;
+    };
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+    const failure = live.sent.find(message => message.type === 'desktop_input' && message.fail);
+    expect(failure?.error).toContain('Too many requests');
+    expect(failure?.detail).toBeUndefined();
   });
 
   it('says a claimed message failed because ChatGPT deleted its chat, not because of the model', async () => {
@@ -2779,6 +3048,7 @@ describe('desktop input delivery and helper ownership', () => {
     expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
     expect(live.sent.find(message => message.type === 'desktop_input' && message.fail)?.error)
       .toBe('This chat was deleted in ChatGPT. Start a new chat to continue.');
+    expect(live.sent.find(message => message.type === 'desktop_input' && message.fail)?.detail).toBeUndefined();
     expect(live.sent).toContainEqual(expect.objectContaining({ type: 'conversation_deleted', conversationId: chatA }));
   });
 
@@ -2798,6 +3068,8 @@ describe('desktop input delivery and helper ownership', () => {
     expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: confirmed });
     expect(selectSettings).toHaveBeenCalledWith('gpt-5.6-sol', 'high', expect.any(Function));
     expect(sent).toHaveBeenCalledTimes(confirmed ? 1 : 0);
+    // A rejected choice carries a code the app reads in any page language (2.1.47 round).
+    if (!confirmed) expect(live.sent.find(message => message.type === 'desktop_input' && message.fail)?.detail).toBe('model-unconfirmed');
     expect(live.sent.filter(message => message.type === 'desktop_input' && message.ack)).toHaveLength(confirmed ? 1 : 0);
   });
 
@@ -12903,6 +13175,22 @@ describe('evidence from the page context', () => {
     ]);
   });
 
+  it('still reports the newest stream request when sixteen older ones wait unconfirmed (#1752)', async () => {
+    const page = live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    // The app cannot place these yet (no call under them so far), so they stay pending.
+    page.reply.set('correlate', () => ({ ok: true, status: 200, data: { ok: true, conversationId, confirmed: [], complete: false } }));
+    const origin = (requestId: string) => page.window.dispatchEvent(new page.window.MessageEvent('message', {
+      source: page.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: 1_700_000_001_000 }
+    }));
+    for (let i = 0; i < 16; i++) { origin(`wfr_waiting_${i}`); await settle(); }
+    origin('wfr_current_turn');
+    await settle();
+    const asked = page.sent.filter((message) => message.type === 'correlate').flatMap((message) => message.calls.map((call: { requestId: string }) => call.requestId));
+    expect(asked).toContain('wfr_current_turn');
+  });
+
   it('does not correlate requests from a Goal helper temporary chat', async () => {
     live = await harness('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee?temporary-chat=true&cos-input=helper-decision#cos-input=helper-decision');
     live.reply.set('correlate', () => ({ ok: true, data: { ok: true, confirmed: ['wfr_helper'] } }));
@@ -14087,6 +14375,23 @@ describe('the activity feed', () => {
     expect(progress).not.toContain('queued-1');
     expect(progress[0]).toBe('queued-2');
     expect(progress.at(-1)).toBe('queued-400');
+  });
+
+  // CodeRabbit on #1908: a diagnostic trace is expendable. It never takes the place of a
+  // transcript observation in a full queue, and dropping one is not a gap in the history.
+  it('drops request traces first, without a gap, and takes none while the queue is filling', async () => {
+    const delivered: Array<Record<string, any>> = [];
+    live = await harness(undefined, { events: (message) => { delivered.push(...message.entries); return { ok: true, pending: 0, durable: true }; } });
+    delivered.length = 0;
+    live.hook.emit({ kind: 'request_trace', traces: [{ requestId: '11111111-2222-4333-8444-555555555555', path: 'v.request_id' }] });
+    for (let index = 0; index < 400; index++) live.hook.emit({ kind: 'progress', text: `queued-${index}` });
+    // A full queue takes no new trace either.
+    live.window.dispatchEvent(new live.window.MessageEvent('message', { source: live.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-trace', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', traces: [{ requestId: '22222222-2222-4333-8444-555555555555', path: 'v.request_id' }] } }));
+    await live.hook.flush(); await live.hook.flush(); await live.hook.flush();
+    expect(delivered.filter(entry => entry.event?.kind === 'request_trace')).toEqual([]);
+    expect(delivered.filter(entry => entry.event?.kind === 'chat_error')).toEqual([]);
+    expect(delivered.filter(entry => entry.event?.kind === 'progress')).toHaveLength(400);
   });
 
   it('does not erase new overflow losses added while an older gap marker is in flight', async () => {
@@ -17004,6 +17309,40 @@ describe('the fresh chat the app opened', () => {
     }
   });
 
+  it.each(['before the page is used', 'over the model picker'])('closes a ChatGPT announcement %s and still starts the worker (2026-10-30)', async when => {
+    let release!: (value: unknown) => void;
+    const redeemed = new Promise(resolve => { release = resolve; });
+    const workerChat = '25252525-3636-4747-8888-909090909090';
+    live = await harness('https://chatgpt.com/?clf=cmd-announce', {
+      redeem: () => redeemed,
+      command_step: () => ({ ok: true }),
+      page_note: () => ({ ok: true }),
+      ack: () => ({ ok: true })
+    }, (document, dom) => {
+      document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+        dom.reconfigure({ url: `https://chatgpt.com/c/${workerChat}` });
+        userTurn(document, 'announced-worker-user', 'Worker task', { sent: false });
+      });
+    });
+    let picks = 0;
+    if (when === 'before the page is used') announcement(live.document);
+    (live.window as any).CLF_DOM.selectModelSettings = vi.fn(async () => {
+      picks++;
+      // The announcement opens as the picker does, and the picker cannot confirm behind it.
+      if (when === 'over the model picker' && picks === 1) { announcement(live!.document); return false; }
+      return !live!.document.querySelector('[role="dialog"]');
+    });
+    release({ ok: true, command: { id: 'cmd-announce', type: 'worker', text: 'Worker task', agent: 'worker-1', model: 'gpt-5.6-sol', reasoningEffort: 'high' } });
+    await settle(600);
+    expect(live.document.querySelector('[role="dialog"]')).toBeNull();
+    expect(live.sent.filter(message => message.type === 'command_step').map(message => message.step)).toContain('sending');
+    expect(live.sent.filter(message => message.type === 'page_note')).toEqual([
+      expect.objectContaining({ note: 'announcement-closed', heading: 'Premium seats just got better' })
+    ]);
+    // It pressed no button of the announcement: nothing was chosen.
+    expect(picks).toBe(when === 'over the model picker' ? 2 : 1);
+  });
+
   // #1086 (2.1.41, VM at 255 MB free): three worker pages pressed Send 38–48 s into their 90 s, saw
   // their new chat only after their copy of the deadline, and returned without a word. The task was in
   // ChatGPT either way; the app takes a late receipt back (adoptLateWorker) and has to get one.
@@ -19581,6 +19920,39 @@ describe('one live isolated-world recorder per document', () => {
     expect(emitted(live.sent, 'app_sightings').map(row => row.event.apps)).toEqual([[sighting]]);
   });
 
+  it('passes on where this chat\'s stream named a request id, once per id and only well formed (#1752)', async () => {
+    live = await harness();
+    await settle();
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const trace = { requestId: '11111111-2222-4333-8444-555555555555', path: '/message:v.metadata.request_id' };
+    const publish = (conversationId: string, traces: unknown[], origin = 'https://chatgpt.com') => live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+      source: live!.window as unknown as Window, origin, data: { type: 'cos-request-trace', conversationId, traces }
+    }));
+    publish(chat, [trace]); await settle();
+    publish(chat, [trace]); await settle();
+    publish('bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', [{ ...trace, requestId: '22222222-2222-4333-8444-555555555555' }]); await settle();
+    publish(chat, [{ requestId: '33333333-2222-4333-8444-555555555555', path: 'a path with spaces' }, { requestId: 'not-an-id', path: 'v.request_id' }]); await settle();
+    publish(chat, [{ ...trace, requestId: '44444444-2222-4333-8444-555555555555' }], 'https://evil.example'); await settle();
+    await settle(); await live.hook.flush(); await settle();
+    expect(emitted(live.sent, 'request_trace').map(row => row.event.traces)).toEqual([[trace]]);
+  });
+
+  it('reports streaming and recorder busy while an approval card hides Stop', async () => {
+    live = await harness();
+    const card = live.document.createElement('div');
+    card.setAttribute('data-codex-approval-surface', 'true');
+    card.append(live.document.createElement('button'), live.document.createElement('button'));
+    card.getClientRects = () => [{ width: 600, height: 200 }] as unknown as DOMRectList;
+    live.document.body.append(card);
+    expect((live.window as any).CLF_DOM.generating()).toBe(false);
+    expect((live.window as any).CLF_DOM.approvalWaiting()).toBe(true);
+    expect(await live.runtimeMessage({ type: 'clf-page-status' })).toMatchObject({ streaming: true, approval: true });
+    expect(await live.runtimeMessage({ type: 'clf-recorder-ping' })).toMatchObject({ busy: true });
+    card.remove();
+    expect(await live.runtimeMessage({ type: 'clf-page-status' })).toMatchObject({ streaming: false, approval: false });
+    expect(await live.runtimeMessage({ type: 'clf-recorder-ping' })).toMatchObject({ busy: false });
+  });
+
   it('reports the recorder protocol version rather than the unrelated Fiber protocol version', async () => {
     live = await harness();
 
@@ -21826,6 +22198,15 @@ describe('the goal loop', () => {
     expect(view({ phase: 'settling', wait: { reason: 'workers' } })).toMatchObject({
       stage: 'Waiting for this chat’s sub-agents', detail: '', at: 0
     });
+    // #1832: the step reviewer's limit is known, so its countdown shows.
+    expect(view({ phase: 'settling', wait: { reason: 'reviewer', until: live.window.Date.now() + 125_000 } })).toMatchObject({
+      stage: 'Waiting for the reviewer', detail: 'Continues without the review in 2:05'
+    });
+    // CodeRabbit on #1879: the next step's draft waits for the review before it asks the helper.
+    expect(view({ phase: 'requesting', model: MODEL, draft: { stage: 'sending', model: MODEL, text: '', reply: '' },
+      wait: { reason: 'reviewer', until: live.window.Date.now() + 125_000 } })).toMatchObject({
+      stage: 'Waiting for the reviewer', detail: 'Continues without the review in 2:05'
+    });
     expect(view({ phase: 'settling', wait: { reason: 'listening', until: live.window.Date.now() + 60_000 } })).toMatchObject({
       stage: 'Waiting for activity after recovery', detail: 'Checking again in 1:00'
     });
@@ -23303,6 +23684,30 @@ describe('app Stop command uses current native turn proof', () => {
     expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '1111111111111111', conversationId, turnId })).toEqual({ ok: true });
     expect(click).toHaveBeenCalledTimes(1);
   });
+  // CodeRabbit on #1947: after the person's Stop, an automatic Continue that the page declines is no
+  // hold to report, even while ChatGPT still shows the answer stopping.
+  it('says nothing about an automatic Continue it declines after the person pressed Stop', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', turnId = 'late-stop-turn';
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, activeTurnId: turnId,
+        stopTurn: { turnId, userMessageId: 'm-late-question' } } }),
+      stop_redeem: () => ({ ok: true, command: { type: 'stop', conversationId, turnId, userMessageId: 'm-late-question' } }),
+      stop_ack: () => ({ ok: true }),
+      page_note: () => ({ ok: true })
+    });
+    await live.runtimeMessage({ type: 'clf-page-status' });
+    userTurn(live.document, 'late-question', 'Native question arrived later', { sent: false });
+    startGenerating(live.document, { send: false });
+    assistantTurn(live.document, 'late-stop-assistant', []);
+    const button = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    Object.defineProperty(button, 'getClientRects', { value: () => [{ width: 10, height: 10 }] });
+    await live.hook.pullActivity();
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '1111111111111111', conversationId, turnId })).toEqual({ ok: true });
+    // ChatGPT still shows Stop: the page declines the Continue, and says nothing.
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: '11111111-2222-4333-8444-555555555555', conversationId,
+      recovery: { questionId: 'm-late-question', stop: false } })).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.type === 'page_note')).toEqual([]);
+  });
   it.each(['original', 'newer', 'missing'])('requires the original native question when reopening Stop (%s)', async question => {
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', turnId = 'persisted-stop-turn';
     let clicks = 0;
@@ -23364,6 +23769,108 @@ describe('app Stop command uses current native turn proof', () => {
     expect(emitted(live!.sent, 'turn_end').map(row => row.event)).toEqual([
       expect.objectContaining({ turnId: h.request.turnId, outcome: 'stopped' })
     ]);
+  });
+
+  it('ends a turn it holds when ChatGPT shows neither Stop nor any answer of it, on the app\'s Stop (2.1.47 round)', async () => {
+    // 2026-10-28: ChatGPT stopped loading the chat's history, so the turn's answer never appeared
+    // and this page held the turn for hours, taking no message. Stop had nothing to click.
+    live = await harness(undefined, { stop_ack: () => ({ ok: true }) });
+    startGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const turnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live.reply.set('stop_redeem', () => ({ ok: true, command: { type: 'stop', turnId, conversationId, held: true } }));
+    stopGenerating(live.document);
+    live.advance(30_000);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toEqual([]);
+    const asked = live.window.Date.now();
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '2222222222222222', turnId, conversationId })).toEqual({ ok: true });
+    // Only after it kept showing nothing for a few seconds.
+    expect(live.window.Date.now() - asked).toBeGreaterThanOrEqual(3_000);
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId, outcome: 'stopped', detail: 'Stopped here: ChatGPT no longer showed this answer running.' })
+    ]);
+  });
+
+  it('also ends a held turn whose answer it had seen when that answer is no longer on the page (CodeRabbit)', async () => {
+    live = await harness(undefined, { stop_ack: () => ({ ok: true }) });
+    startGenerating(live.document);
+    const answer = assistantTurn(live.document, 'answer-that-goes-away', []);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const turnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live.reply.set('stop_redeem', () => ({ ok: true, command: { type: 'stop', turnId, conversationId, held: true } }));
+    // The history stops loading: the answer section leaves the page, ChatGPT shows no Stop.
+    answer.remove();
+    stopGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toEqual([]);
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '3333333333333333', turnId, conversationId })).toEqual({ ok: true });
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([expect.objectContaining({ turnId, outcome: 'stopped' })]);
+  });
+
+  it('never ends a turn this way for a Stop the app made for a running turn, or when the answer shows up again (CodeRabbit)', async () => {
+    live = await harness(undefined, { stop_ack: () => ({ ok: true }) });
+    startGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const turnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    // A remount: ChatGPT's Stop and the answer are gone for a moment, while the turn still runs.
+    stopGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    // The app asked to stop a running turn (no `held`): only ChatGPT's own Stop may end it, and the
+    // command stays pending (no failed acknowledgement) for when that Stop shows again (CodeRabbit).
+    const acks: unknown[] = [];
+    live.reply.set('stop_ack', (message: unknown) => { acks.push(message); return { ok: true }; });
+    live.reply.set('stop_redeem', () => ({ ok: true, command: { type: 'stop', turnId, conversationId } }));
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '4444444444444444', turnId, conversationId })).toEqual({ ok: false });
+    expect(acks).toEqual([]);
+  });
+
+  it('uses ChatGPT\'s own Stop when a remounted answer and its Stop come back during a held-turn Stop (CodeRabbit)', async () => {
+    live = await harness(undefined, { stop_ack: () => ({ ok: true }) });
+    startGenerating(live.document);
+    const answer = assistantTurn(live.document, 'remounted-answer', []);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const turnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    // A remount: the answer and ChatGPT's Stop are gone for a moment.
+    answer.remove();
+    stopGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    let clicks = 0, back = false;
+    live.reply.set('stop_redeem', () => {
+      if (back) return { ok: true, command: { type: 'stop', turnId, conversationId, held: true } };
+      back = true;
+      // ...and back while the Stop is being redeemed.
+      live!.document.querySelector('#thread')!.append(answer);
+      startGenerating(live!.document, { send: false });
+      const button = live!.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+      Object.defineProperty(button, 'getClientRects', { value: () => [{ width: 10, height: 10 }] });
+      button.addEventListener('click', () => { clicks++; });
+      return { ok: true, command: { type: 'stop', turnId, conversationId, held: true } };
+    });
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '7777777777777777', turnId, conversationId })).toEqual({ ok: true });
+    expect(clicks).toBe(1);
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end').some(row => /Stopped here/.test(String(row.event.detail ?? '')))).toBe(false);
+  });
+
+  it('does not end a held turn after its Stop command expired during the wait (CodeRabbit)', async () => {
+    live = await harness(undefined, { stop_ack: () => ({ ok: true }) });
+    startGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const turnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    stopGenerating(live.document);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    live.reply.set('stop_redeem', () => ({ ok: true, command: { type: 'stop', turnId, conversationId, held: true, expiresAt: live!.window.Date.now() + 1_000 } }));
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: '6666666666666666', turnId, conversationId })).toEqual({ ok: false });
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toEqual([]);
   });
 
   it('does not confirm a Stop command while the native page continues generating', async () => {
@@ -23712,6 +24219,19 @@ describe('ordinary Continue native recovery', () => {
   const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
   const id = '11111111-2222-4333-8444-555555555555';
   const text = 'Continue until fully finished. Tur Tur Sahur.';
+  // 2026-10-30: a queued Continue sat unsent for 17 minutes on a page that looked healthy, and nothing
+  // said why. A page whose last question it cannot read now says so instead of declining in silence.
+  it.each([['no question on the page', null, 'recovery-question-unreadable'], ['another question', 'm-other', 'recovery-question-changed']] as const)(
+    'says why it holds an automatic Continue back: %s', async (_case, shown, reason) => {
+      live = await harness(`https://chatgpt.com/c/${chat}`, { page_note: () => ({ ok: true }) });
+      if (shown) userTurn(live.document, shown, 'A different question');
+      live.hook.observe(); await settle();
+      expect(await live.runtimeMessage({ type: 'clf-desktop-input', id, conversationId: chat, silenceTurnId: 'source-turn',
+        recovery: { questionId: 'm-source', stop: false } })).toEqual({ ok: false });
+      expect(live.sent.filter(message => message.type === 'page_note')).toEqual([
+        expect.objectContaining({ note: 'input-held', reason, inputId: id, conversationId: chat })
+      ]);
+    });
   it.each(['idle', 'busy'] as const)('repairs a %s Continue whose fresh page-model scan cannot map the latest assistant turn', async scenario => {
     live = await harness(`https://chatgpt.com/c/${chat}`, {
       desktop_input: message => ({ ok: true, data: message.recoveryAction || message.authorize || message.ack || message.fail
@@ -24272,10 +24792,19 @@ describe('creating a native ChatGPT Project', () => {
   const request = { id: 'aaaaaaaa-1111-4222-8333-444444444444', name: 'my-app' };
   const nativeId = `g-p-${'f'.repeat(32)}`;
   const shown = (node: Element) => { (node as HTMLElement).getClientRects = () => [{ width: 100, height: 20 }] as unknown as DOMRectList; };
-  function nativeDialog(document: Document, dom: JSDOM, created = true, landsOn = nativeId) {
+  function nativeDialog(document: Document, dom: JSDOM, created = true, landsOn = nativeId, surface: 'sidebar' | 'index' = 'sidebar') {
     const button = document.createElement('button');
-    button.setAttribute('data-app-action-sidebar-project-create', ''); button.setAttribute('aria-label', 'Adicionar novo projeto');
-    shown(button); document.body.append(button);
+    if (surface === 'index') {
+      const search = document.createElement('input'); search.id = 'projects-index-search';
+      const wrapper = document.createElement('div'); wrapper.setAttribute('data-chatgpt-project-conversation-drop-target', '');
+      button.type = 'button'; button.setAttribute('data-color', 'primary'); button.setAttribute('data-variant', 'solid');
+      button.textContent = 'Criar';
+      wrapper.append(button); document.body.append(search, wrapper);
+    } else {
+      button.setAttribute('data-app-action-sidebar-project-create', ''); button.setAttribute('aria-label', 'Adicionar novo projeto');
+      document.body.append(button);
+    }
+    shown(button);
     button.addEventListener('click', () => {
       const dialog = document.createElement('div');
       dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true');
@@ -24301,6 +24830,57 @@ describe('creating a native ChatGPT Project', () => {
     expect(reports.map(row => row.action)).toEqual(['claim', 'arm', 'done']);
     expect(reports[2]).toMatchObject({ id: request.id, chatgptId: nativeId });
     expect(await live.runtimeMessage({ type: 'clf-project-create-state', id: request.id })).toMatchObject({ safe: true });
+  });
+
+  it('creates from the current Projects index without depending on the translated Create label', async () => {
+    const reports: Array<Record<string, any>> = [];
+    live = await harness(`https://chatgpt.com/projects?cos-project-create=${request.id}`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    }, (document, dom) => nativeDialog(document, dom, true, nativeId, 'index'));
+    expect(await live.runtimeMessage({ type: 'clf-project-create', request })).toEqual({ ok: true });
+    expect(reports.map(row => row.action)).toEqual(['claim', 'arm', 'done']);
+    expect(reports[2]).toMatchObject({ id: request.id, chatgptId: nativeId });
+  });
+
+  it('can safely close a failed Projects-index helper without affecting the project list', async () => {
+    live = await harness(`https://chatgpt.com/projects?cos-project-create=${request.id}`);
+    expect(await live.runtimeMessage({ type: 'clf-project-create-state', id: request.id })).toEqual({ safe: true });
+  });
+
+  it.each(['/', '/projects'])('keeps the %s helper open while the native Create project dialog holds a draft', async path => {
+    live = await harness(`https://chatgpt.com${path}?cos-project-create=${request.id}`, {}, document => {
+      const dialog = document.createElement('div');
+      dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true');
+      dialog.innerHTML = '<form><input id="chatgpt-project-name" type="text"><button type="submit">Create</button></form>';
+      shown(dialog); document.body.append(dialog);
+    });
+    const dialog = live.document.querySelector('[role="dialog"]')!;
+    expect(await live.runtimeMessage({ type: 'clf-project-create-state', id: request.id })).toEqual({ safe: false });
+    (dialog.querySelector('input') as HTMLInputElement).value = 'unfinished draft';
+    expect(await live.runtimeMessage({ type: 'clf-project-create-state', id: request.id })).toEqual({ safe: false });
+    dialog.remove();
+    expect(await live.runtimeMessage({ type: 'clf-project-create-state', id: request.id })).toEqual({ safe: true });
+  });
+
+  it('will not click a primary button outside the Projects index\'s Create spot', async () => {
+    const reports: Array<Record<string, any>> = [];
+    let clicks = 0;
+    live = await harness(`https://chatgpt.com/projects?cos-project-create=${request.id}`, {
+      project_create: message => { reports.push(message); return { ok: true, data: { ok: true } }; }
+    }, document => {
+      // The Projects index itself (its marker and drop target), with a primary button elsewhere on the page.
+      const search = document.createElement('input'); search.id = 'projects-index-search';
+      const wrapper = document.createElement('div'); wrapper.setAttribute('data-chatgpt-project-conversation-drop-target', '');
+      const unrelated = document.createElement('button');
+      unrelated.type = 'button'; unrelated.setAttribute('data-color', 'primary'); unrelated.setAttribute('data-variant', 'solid');
+      shown(unrelated); unrelated.addEventListener('click', () => { clicks++; });
+      document.body.append(search, wrapper, unrelated);
+    });
+    const created = live.runtimeMessage({ type: 'clf-project-create', request });
+    await settle(21_000);
+    expect(await created).toEqual({ ok: false });
+    expect(clicks).toBe(0);
+    expect(reports.map(row => row.action)).toEqual(['claim', 'fail']);
   });
 
   it('fails the claimed request, before anything is armed, when ChatGPT shows no New project control', async () => {
@@ -24620,6 +25200,25 @@ describe('edit and resubmit (#365)', () => {
     expect(claims.filter(message => message.ack)).toEqual([expect.objectContaining({ messageId: edited, conversationId: chat })]);
     // The composer is never touched by an edit.
     expect(live!.document.querySelector('#prompt-textarea')!.textContent).toBe('');
+  });
+
+  it('reports a provider limit seen while the edit\'s model was being chosen, not a model failure (CodeRabbit)', async () => {
+    const { claims } = await editPage();
+    const notice = live!.document.createElement('div');
+    notice.setAttribute('role', 'dialog');
+    Object.defineProperty(notice, 'getClientRects', { value: () => [{ width: 400, height: 200 }] });
+    notice.innerHTML = '<h2>Too many requests</h2><p>We have temporarily limited access to conversations to protect your data. Please wait a few minutes.</p>';
+    live!.window.CLF_DOM.selectModelSettings = async () => {
+      live!.document.body.append(notice);
+      expect(live!.window.CLF_DOM.errors().some((error: any) => error.blocking)).toBe(true);
+      notice.remove();
+      return false;
+    };
+    expect(await live!.runtimeMessage(offer())).toEqual({ ok: false });
+    const failure = claims.find(message => message.fail);
+    expect(failure?.error).toContain('Too many requests');
+    expect(failure?.detail).toBeUndefined();
+    expect(claims.some(message => message.authorize)).toBe(false);
   });
 
   it('says the question is gone when the page no longer shows it, and sends nothing', async () => {

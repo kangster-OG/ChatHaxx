@@ -5,10 +5,11 @@ import type { MultiAgentSettings } from '../shared/types.js';
 import { workerReportedFinish } from '../shared/session-activity.js';
 import { evaluateWorkerOverviewHealth } from '../shared/agent-health.js';
 import { workerOwnTask } from '../shared/worker-brief.js';
-import { compactNumber, el, icon } from './dom.js';
+import { compactNumber, el, elapsedDurationText, icon } from './dom.js';
 import { attachWorkPanelResize } from './work-panel-resize.js';
 import { workerAvatar } from './agent-communication.js';
 import { renderWorkerActivity } from './agent-activity.js';
+import { localToolTitle } from './tool-titles.js';
 
 /**
  * What to call a worker: the name the prime gave it for this job ("Security review"), else
@@ -164,8 +165,8 @@ export function createAgentPanel(options: {
         const observed = worker.selectedModel && worker.conversationId && worker.selectedModel.conversationId === worker.conversationId
           ? worker.selectedModel : null;
         const elapsedMs = Math.max(0, (active ? Date.now() : worker.endedAt ?? worker.updatedAt) - worker.startedAt);
-        const elapsed = elapsedMs < 60_000 ? `${Math.floor(elapsedMs / 1000)}s`
-          : elapsedMs < 3_600_000 ? `${Math.floor(elapsedMs / 60_000)}m` : `${Math.floor(elapsedMs / 3_600_000)}h`;
+        // One unit, up to days: a worker running since yesterday reads "1d", not "26h".
+        const elapsed = elapsedDurationText(elapsedMs / 1000, 1);
         const working = state === 'working' || state === 'active';
         // The avatar carries the state: a dot of presence, and while working the app's traveling
         // light around it (the connection capsule's). Its phase follows the clock, so the many
@@ -193,18 +194,36 @@ export function createAgentPanel(options: {
         const activityBoundary = Math.max(worker.lastFinishReportAt ?? 0, worker.lastTurnEndAt ?? 0);
         const currentActivity = worker.lastToolCallAt != null && worker.lastToolCallAt > activityBoundary &&
           worker.lastToolCallAt >= (worker.finishTurn?.startedAt ?? 0);
-        // A failed worker keeps its last action in view: where it stopped is the first thing to know.
-        const lastAction = state === 'failed' && worker.lastToolActivity
-          ? el('span', 'agent-card-last', () => t('Last action: {0}', [worker.lastToolActivity!.title])) : null;
-        const activity = working && currentActivity && worker.lastToolActivity ? el('span', 'agent-card-activity', worker.lastToolActivity.title) : null;
-        if (activity) {
-          activity.dataset.kind = worker.lastToolActivity!.kind;
-          activity.style.setProperty('--phase', `${-(Date.now() % 1800)}ms`);
+        // One line of what the worker is doing (#1831), in the words its chat already uses: ChatGPT's
+        // approval card holding it, else its current step (a failed one in the tool row's red), else
+        // the first line of its answer; a finished worker keeps that answer. A failed worker keeps its
+        // last action in view: where it stopped is the first thing to know.
+        const done = state === 'history' || state === 'failed';
+        const answered = Boolean(worker.lastAnswerLine) && (worker.lastAssistantFinalAt ?? 0) >= (worker.lastToolCallAt ?? 0) &&
+          (worker.lastAssistantFinalAt ?? 0) >= (worker.finishTurn?.startedAt ?? 0);
+        let line: HTMLElement | null = null;
+        if (!done && worker.approvalWaitingAt != null) {
+          line = el('span', 'agent-card-line agent-card-approval', () => t('Needs your answer in ChatGPT'));
+          line.dataset.tone = 'warn';
+        } else if (state === 'failed' && worker.lastToolActivity) {
+          line = el('span', 'agent-card-line agent-card-last', () => t('Last action: {0}', [localToolTitle(worker.lastToolActivity!.title)]));
+        } else if (working && currentActivity && worker.lastToolActivity && !answered) {
+          const activity = worker.lastToolActivity.title;
+          line = el('span', 'agent-card-line agent-card-activity', () => localToolTitle(activity));
+          line.dataset.kind = worker.lastToolActivity.kind;
+          if (worker.lastToolActivity.tone) line.dataset.tone = worker.lastToolActivity.tone;
+          line.style.setProperty('--phase', `${-(Date.now() % 1800)}ms`);
+        } else if (worker.lastAnswerLine && (answered || !working) && state !== 'waking') {
+          // A worker being woken has a new job; its previous answer belongs to the old one.
+          line = el('span', 'agent-card-line agent-card-answer', worker.lastAnswerLine);
         }
-        content.append(heading, el('span', 'agent-card-task', task), ...(activity ? [activity] : lastAction ? [lastAction] : []), meta);
+        // Cut to the card's width; the whole line is one hover away and part of the row's name.
+        if (line) { const shown = line; ui(shown, 'title', () => shown.textContent ?? ''); }
+        content.append(heading, el('span', 'agent-card-task', task), ...(line ? [line] : []), meta);
         row.append(portrait, content);
         // The id the prime and the chat use for it (worker-2) stays one hover away, and in its avatar.
-        row.title = `${identity} · ${task}`;
+        if (line) { const shown = line; ui(row, 'title', () => `${identity} · ${task} · ${shown.textContent ?? ''}`); }
+        else row.title = `${identity} · ${task}`;
         row.onclick = () => void open(worker.id);
         body.append(row);
       }

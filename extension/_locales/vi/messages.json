@@ -503,6 +503,12 @@
   "content_goal_wait_tool_inactivity": {
     "message": "Đang chờ công cụ ngừng hoạt động"
   },
+  "content_goal_reviewer_deadline": {
+    "message": "Tiếp tục mà không cần xem lại sau $1"
+  },
+  "content_goal_wait_reviewer": {
+    "message": "Đang chờ người xem lại"
+  },
   "content_goal_wait_workers": {
     "message": "Đang chờ các tác nhân phụ của cuộc trò chuyện này"
   },
@@ -697,6 +703,9 @@
   },
   "content_turn_stop_requested": {
     "message": "Đã yêu cầu dừng; trang gốc không còn hiển thị trạng thái đang tạo."
+  },
+  "content_turn_stop_unseen": {
+    "message": "Đã dừng tại đây: ChatGPT không còn hiển thị câu trả lời này đang chạy."
   },
   "content_unknown_error": {
     "message": "lỗi không xác định"
@@ -917,6 +926,9 @@
   "popup_pipeline_waiting_first_message": {
     "message": "Đang chờ tin nhắn đầu tiên."
   },
+  "popup_pipeline_not_a_chat": {
+    "message": "Trang ChatGPT này không phải là cuộc trò chuyện, nên ứng dụng không có gì để theo dõi ở đây. Hãy mở hoặc bắt đầu một cuộc trò chuyện."
+  },
   "popup_pipeline_waiting_latest_request_id": {
     "message": "Đã ghi cuộc trò chuyện. Đang chờ ID yêu cầu từ lượt mới nhất."
   },
@@ -985,6 +997,9 @@
   },
   "popup_status_new_chat": {
     "message": "cuộc trò chuyện mới"
+  },
+  "popup_status_not_a_chat": {
+    "message": "không phải cuộc trò chuyện"
   },
   "popup_status_none_open": {
     "message": "không có mục nào đang mở"
