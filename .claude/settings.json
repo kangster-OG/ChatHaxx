@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "deny": [
+      "mcp__figwright",
+      "mcp__claude_ai_Mobbin",
+      "mcp__claude_ai_Google_Slides",
+      "mcp__claude_ai_Claude_Docs"
+    ]
+  },
+  "skillOverrides": {
+    "figma-build": "off",
+    "figma-codegen": "off",
+    "league-on-kanggang": "off",
+    "artifact-design": "off",
+    "artifact-diagramming": "off",
+    "artifact-capabilities": "off",
+    "artifact-emulator": "off",
+    "google-workspace": "off",
+    "switch-to-api-credits": "user-invocable-only",
+    "appstore-readiness-audit": "user-invocable-only",
+    "dataviz": "user-invocable-only",
+    "keybindings-help": "user-invocable-only",
+    "fewer-permission-prompts": "user-invocable-only",
+    "schedule": "user-invocable-only",
+    "plugin-authoring": "user-invocable-only",
+    "init": "user-invocable-only",
+    "anthropic-skills:deep-research": "user-invocable-only",
+    "docs": "user-invocable-only",
+    "docx": "user-invocable-only",
+    "xlsx": "user-invocable-only",
+    "pptx": "user-invocable-only",
+    "pdf": "user-invocable-only",
+    "import-memory": "user-invocable-only",
+    "morning": "user-invocable-only",
+    "skill-creator": "user-invocable-only"
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_ARTIFACT": "1"
+  }
+}
