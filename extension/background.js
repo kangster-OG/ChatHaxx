@@ -373,6 +373,14 @@ async function loadOnce() {
   stored.inputOpenings = { ...(stored.desktopInputTabs || {}), ...(stored.inputOpenings || {}) };
   inputOpenings = stored.inputOpenings && typeof stored.inputOpenings === 'object' && !Array.isArray(stored.inputOpenings)
     ? Object.fromEntries(Object.entries(stored.inputOpenings).filter(([id, row]) => /^[a-f0-9-]{36}$/i.test(id) && row && (row.tab === null || Number.isInteger(row.tab))).slice(-1000)) : {};
+  // Elections saved under the old key move once into `inputOpenings`: left behind, one forgotten
+  // there would come back at the next start (CodeRabbit on #1980).
+  if (stored.desktopInputTabs !== undefined) {
+    try {
+      await chrome.storage.local.set({ inputOpenings });
+      await chrome.storage.local.remove('desktopInputTabs');
+    } catch { /* The next start merges them again; nothing is lost. */ }
+  }
   stopOpenings = stored.stopOpenings && typeof stored.stopOpenings === 'object' && !Array.isArray(stored.stopOpenings)
     ? Object.fromEntries(Object.entries(stored.stopOpenings).filter(([id, row]) => commandMarkerId(id) && row &&
       (row.tab === null || Number.isInteger(row.tab)) && cleanConversationId(row.conversationId) &&
@@ -1215,7 +1223,7 @@ async function latchAppDisconnect() {
   void getBrowserController().then(controller => controller?.revoke()).catch(() => undefined);
   token = null;
   disconnected = true;
-  await activeTabs?.revoke().catch(() => undefined);
+  await renderingLeases(() => activeTabs?.revoke());
   await persist();
 }
 
@@ -2225,6 +2233,13 @@ async function protectCreatedTab(tab, commandId = null) {
 }
 
 /** Bound waiting for a page; a missing reply never grants action or replay authority. */
+/** How long a status pass waits for the rendering leases before it goes on to its repairs. */
+const RENDERING_LEASE_WAIT_MS = 3000;
+/** A rendering lease change, waited for a bounded time and never failing its caller; it goes on by itself. */
+function renderingLeases(change) {
+  return browserReply(async () => { await change(); return null; }, RENDERING_LEASE_WAIT_MS);
+}
+
 async function browserReply(read, timeoutMs = 3000) {
   let timer;
   try {
@@ -2254,6 +2269,30 @@ function offerDesktopInput(tabId, message) {
   // one desktopInputBusy slot, then the app's durable browser claim and one-time
   // sendAuthorizedAt fence every later offer. Waiting here only starves repairs.
   void chrome.tabs.sendMessage(tabId, message).catch(() => undefined);
+}
+
+// Missing-tab reports only expose a pre-claim failure in main; they never
+// authorize a new tab or Send. Keep their slow bridge requests off the single
+// maintenance flight, with a small bound shared across consecutive passes.
+// A failed report leaves the durable election intact for the next normal pass.
+const openingUnavailableReports = new Map();
+const MAX_OPENING_UNAVAILABLE_REPORTS = 3;
+function reportUnavailableOpening(id, tab, stage) {
+  if (openingUnavailableReports.has(id) || openingUnavailableReports.size >= MAX_OPENING_UNAVAILABLE_REPORTS) return;
+  const pending = call('/input/opening-unavailable', { method: 'POST',
+    body: JSON.stringify({ id, tab, stage }) }).then(async reply => {
+    // The app proved nothing reached the lost tab and grants a fresh one: forget the old election,
+    // so the next pass opens a new tab for this new chat (#1950 follow-up). Only then.
+    if (reply?.ok && reply.data?.reopen === true && inputOpenings[id]?.tab === tab) {
+      delete inputOpenings[id];
+      await persistLive();
+    }
+    return reply;
+  });
+  openingUnavailableReports.set(id, pending);
+  void pending.catch(() => undefined).finally(() => {
+    if (openingUnavailableReports.get(id) === pending) openingUnavailableReports.delete(id);
+  });
 }
 
 async function deliverDesktopInputs(inputs, background, reusableConversations = [], activeIds, refreshRendering = async () => {}) {
@@ -2394,7 +2433,19 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     if (!tab) {
       // Handout is opening authority, not a missing delivery receipt. A closed or
       // unresponsive elected document never grants another opening attempt.
-      if (elections[input.id] && !recoveredReuse) continue;
+      if (elections[input.id] && !recoveredReuse) {
+        // Chrome tab ids do not survive every close/restart. Keep spent opening
+        // authority, but let main expose a safe pre-claim failure instead of waiting
+        // forever. A successful all-tab scan must prove absence, not just navigation
+        // away from ChatGPT; another marked tab or an unreadable scan stays ambiguous.
+        if (!target && !branchInput && !input.lifetime && Number.isInteger(elected?.tab) &&
+            ['ready', 'preparing'].includes(elected.stage)) {
+          const currentTabs = await chrome.tabs.query({}).catch(() => null);
+          if (Array.isArray(currentTabs) && !currentTabs.some(row => row.id === elected.tab || matchesInput(input, row)))
+            reportUnavailableOpening(input.id, elected.tab, elected.stage);
+        }
+        continue;
+      }
       if (Object.keys(elections).length >= 1000) continue;
       // A new chat of a project with a native ChatGPT Project opens on that Project's own page;
       // borrowing another tab would go through ChatGPT's New chat, which is the root.
@@ -2820,7 +2871,9 @@ function inspectRequestedModels(request) {
       ...(typeof tabDocuments[key] === 'string' ? { documentId: tabDocuments[key] } : {}),
       ...(Number.isSafeInteger(tabEpochs[key]) ? { navigationEpoch: tabEpochs[key] } : {}) });
     if (intent !== connectionEpoch || !token || disconnected || Date.now() >= wanted.expiresAt) return;
-    await activeTabs?.set(`catalog:${wanted.nonce}`, [tab]);
+    // Bounded and never failing, like every lease change: another tab's pending release must not end this
+    // inspection (CodeRabbit on #2027).
+    await renderingLeases(() => activeTabs?.set(`catalog:${wanted.nonce}`, [tab]));
     await waiting('inspecting');
     if (!current()) return;
     const inspected = await send({ type: 'clf-model-catalog', nonce: wanted.nonce, expiresAt: wanted.expiresAt });
@@ -2829,7 +2882,7 @@ function inspectRequestedModels(request) {
     if (inspected === true || inspected?.ok === true) await retireCatalogTabs();
     else await waiting(inspected?.reason || 'result_unconfirmed');
   })().catch(() => waiting('inspection_failed')).finally(async () => {
-    if (targetNonce) await activeTabs?.set(`catalog:${targetNonce}`, []).catch(() => undefined);
+    if (targetNonce) await renderingLeases(() => activeTabs?.set(`catalog:${targetNonce}`, []));
     if (targetNonce) await releaseModelCatalogTarget(targetNonce);
     modelCatalogFlight = null;
   });
@@ -3080,17 +3133,100 @@ function maintain(woken = false) {
  */
 const APP_LANGUAGE_KEY = 'appLanguage';
 const APP_LANGUAGES = new Set(['en', 'de', 'es', 'fr', 'pt-BR', 'pt-PT', 'ru', 'tr', 'vi', 'ja', 'ko', 'zh-CN', 'zh-TW']);
-async function followApp(data) {
-  const stored = await chrome.storage.local.get([APP_LANGUAGE_KEY, RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
-  const patch = {};
-  if (APP_LANGUAGES.has(data?.language) && stored[APP_LANGUAGE_KEY] !== data.language) patch[APP_LANGUAGE_KEY] = data.language;
+/*
+ * 2026-10-30: the extension in one Chrome never stored the app's language in weeks (the same build
+ * stored it at once elsewhere) and showed Chrome's language until its worker restarted. Nothing said
+ * why: a storage read that never answers, or a refused write, was swallowed. So the read is bounded,
+ * the language is written once per worker and again on a change rather than trusted to the stored copy,
+ * and the outcome is kept for the diagnostics report (`appLanguageState`).
+ */
+const FOLLOW_READ_MS = 5_000;
+let appLanguageApplied = null;
+let appLanguageError = null;
+/** A write that failed or timed out may still land later, so the next status writes again (CodeRabbit on #1940). */
+let appLanguageUnconfirmed = false;
+function appLanguageState() {
+  return { applied: appLanguageApplied, error: appLanguageError };
+}
+/** A storage call that gives up after FOLLOW_READ_MS instead of waiting for good. */
+async function boundedStorage(call, what) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      call,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`storage ${what} did not answer within ${FOLLOW_READ_MS / 1000} s`)), FOLLOW_READ_MS); })
+    ]);
+  } finally { clearTimeout(timer); }
+}
+function boundedStorageGet(keys) {
+  return boundedStorage(chrome.storage.local.get(keys), 'read');
+}
+// Statuses are applied one at a time, so a slow older read can never write its language after a
+// newer one. While one runs, only the newest waiting status is kept: a burst of statuses must not
+// queue a read each and hold a newer language back (CodeRabbit on #1940). A status without a
+// language or kept preferences keeps the waiting one's.
+let followWaiting = null;
+let followRunning = null;
+function followApp(data) {
+  followWaiting = {
+    language: data?.language ?? followWaiting?.language,
+    browserPreferences: data?.browserPreferences ?? followWaiting?.browserPreferences
+  };
+  followRunning ??= (async () => {
+    try {
+      while (followWaiting) {
+        const next = followWaiting;
+        followWaiting = null;
+        await followAppNow(next).catch(() => undefined);
+      }
+    } finally { followRunning = null; }
+  })();
+  return followRunning;
+}
+/**
+ * Settles once no status is being applied, at most after two bounded storage calls and a little: a
+ * diagnostics snapshot read just after a language change otherwise saw the old stored language,
+ * and the app logged a mismatch that was not one (CodeRabbit on #1940).
+ */
+function followSettled() {
+  let timer = null;
+  return Promise.race([followRunning ?? Promise.resolve(), new Promise(resolve => { timer = setTimeout(resolve, 2 * FOLLOW_READ_MS + 1_000); })])
+    .catch(() => undefined).finally(() => clearTimeout(timer));
+}
+async function followAppNow(data) {
+  const language = APP_LANGUAGES.has(data?.language) ? data.language : null;
   const kept = data?.browserPreferences;
-  if (kept && typeof kept.overwrite === 'boolean' && typeof kept.durations === 'boolean' &&
-      !(RENDER_STREAM_KEY in stored) && !(SHOW_TIMES_KEY in stored)) {
+  const keptValid = kept && typeof kept.overwrite === 'boolean' && typeof kept.durations === 'boolean';
+  if ((!language || (language === appLanguageApplied && !appLanguageUnconfirmed)) && !keptValid) return;
+  let readFailed = null;
+  const stored = await boundedStorageGet([APP_LANGUAGE_KEY, RENDER_STREAM_KEY, SHOW_TIMES_KEY])
+    .catch(error => { readFailed = String(error?.message || error).slice(0, 200); return null; });
+  const patch = {};
+  // Unread storage still gets the language: it is the app's, not a preference the person set here.
+  if (language && (language !== appLanguageApplied || appLanguageUnconfirmed) && (!stored || stored[APP_LANGUAGE_KEY] !== language)) patch[APP_LANGUAGE_KEY] = language;
+  // Kept preferences only fill an extension that provably has none, so they need the read.
+  if (keptValid && stored && !(RENDER_STREAM_KEY in stored) && !(SHOW_TIMES_KEY in stored)) {
     patch[RENDER_STREAM_KEY] = kept.overwrite;
     patch[SHOW_TIMES_KEY] = kept.durations;
   }
-  if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+  // The worker takes the app's language at once, whatever storage does: a page that asks
+  // (`i18n_catalog` with `current`) gets it even while the write below fails (CodeRabbit on #1940).
+  // A failed write stays unconfirmed, so the next status writes again.
+  if (language) appLanguageApplied = language;
+  try {
+    // A write that never answers is bounded too: it must not hold every later status (CodeRabbit on #1940).
+    if (Object.keys(patch).length) await boundedStorage(chrome.storage.local.set(patch), 'write');
+    if (language) appLanguageApplied = language;
+    // Confirmed only by writing the language, or by reading it already stored: a status with kept
+    // preferences alone proves nothing about it (CodeRabbit on #1940).
+    if (patch[APP_LANGUAGE_KEY] || (language && stored?.[APP_LANGUAGE_KEY] === language)) appLanguageUnconfirmed = false;
+    // An unconfirmed language keeps the error that left it unsaved (CodeRabbit on #1940).
+    if (!appLanguageUnconfirmed) appLanguageError = readFailed;
+  } catch (error) {
+    if (patch[APP_LANGUAGE_KEY]) appLanguageUnconfirmed = true;
+    // A failed preferences-only write does not replace the reason the language is still unsaved (CodeRabbit on #1940).
+    if (patch[APP_LANGUAGE_KEY] || !appLanguageUnconfirmed) appLanguageError = String(error?.message || error).slice(0, 200);
+  }
 }
 
 /**
@@ -3200,16 +3336,21 @@ async function revealChats(ids) {
   for (const raw of ids.slice(0, 5)) {
     const conversationId = cleanConversationId(raw);
     if (!conversationId) continue;
-    const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-    const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
-    const shown = tab
-      ? await chrome.tabs.update(tab.id, { active: true })
-      : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
-    const windowId = shown?.windowId ?? tab?.windowId;
-    if (!Number.isInteger(windowId)) continue;
-    // A worker tab can sit in the app's minimized background window; the user asked to see it.
-    const window = await chrome.windows.get(windowId).catch(() => null);
-    await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
+    try {
+      const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+      const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
+      const shown = tab
+        ? await chrome.tabs.update(tab.id, { active: true })
+        : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
+      const windowId = shown?.windowId ?? tab?.windowId;
+      if (!Number.isInteger(windowId)) throw new Error('no window');
+      // A worker tab can sit in the app's minimized background window; the user asked to see it.
+      const window = await chrome.windows.get(windowId).catch(() => null);
+      await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
+    } catch {
+      // Taking the chat is not showing it: say so, so the app does not count it as shown (CodeRabbit on #2027).
+      await call('/reveal/failed', { method: 'POST', body: JSON.stringify({ conversationId }) }).catch(() => undefined);
+    }
   }
 }
 
@@ -3247,6 +3388,24 @@ function updatedByBrowser() {
   return typeof chrome.runtime.getBrowserInfo === 'function';
 }
 
+/** How long an offered update waits only for answering ChatGPT pages before it goes ahead anyway. */
+const CHAT_BUSY_UPDATE_AFTER_MS = 30 * 60_000;
+/** Since when this update attempt has waited for answering pages, kept across worker restarts. */
+let chatBusySince = null;
+async function chatBusyWait(attempt) {
+  const key = 'extensionUpdateBusySince';
+  if (!chatBusySince) {
+    const stored = await chrome.storage.session?.get?.(key).catch(() => null);
+    const saved = stored?.[key];
+    if (saved && saved.attempt === attempt && Number.isFinite(saved.at)) chatBusySince = saved;
+  }
+  if (!chatBusySince || chatBusySince.attempt !== attempt) {
+    chatBusySince = { attempt, at: Date.now() };
+    await chrome.storage.session?.set?.({ [key]: chatBusySince }).catch(() => undefined);
+  }
+  return Math.max(0, Date.now() - chatBusySince.at);
+}
+
 async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands, liveSending = null) {
   if (extensionReloadPending) return;
   if (updatedByBrowser()) { extensionUpdateHold = offer ? 'browser-updates-itself' : null; return; }
@@ -3266,18 +3425,30 @@ async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands, liveS
   if (liveCommands.size) { extensionUpdateHold = 'commands'; return; }
   const attempt = `${workerStampValue}>${offer.build}`;
   if ((await chrome.storage.local.get('extensionReloadAttempt')).extensionReloadAttempt === attempt) { extensionUpdateHold = 'already-tried'; return; }
+  let busyFor = 0;
   for (const tab of await chrome.tabs.query({ url: CHATGPT_TAB_URLS })) {
     if (!Number.isInteger(tab.id) || tab.discarded === true) continue;
     const ping = await tabReply(tab.id, { type: 'clf-recorder-ping' }).catch(() => null);
     // A page that cannot answer has nothing running here. One that answers without `busy` runs an
     // older recorder that cannot say, so it is treated as busy.
-    if (ping && ping.busy !== false) { extensionUpdateHold = 'chat-busy'; return; }
+    if (ping && ping.busy !== false) {
+      // Long Goal and Loop chats answer almost without a pause, so an update that waits for every
+      // page to be idle could wait for days (2026-10-31, the maintainer's Mac). After waiting this
+      // long only for answering pages, it goes ahead at a moment when no tool call runs and nothing
+      // is being sent: the reload re-injects the pages, and the app recovers an answer in progress.
+      busyFor = await chatBusyWait(attempt);
+      if (busyFor < CHAT_BUSY_UPDATE_AFTER_MS) { extensionUpdateHold = 'chat-busy'; return; }
+      break;
+    }
   }
   extensionReloadPending = true;
   try {
-    const prepared = await call('/extension/update', { method: 'POST', body: '{}' });
+    const prepared = await call('/extension/update', { method: 'POST',
+      body: JSON.stringify(busyFor ? { pastBusyChatsMs: busyFor } : {}) });
     // The app saw a message go out since the last status: that holds the update, as one listed would.
     if (prepared.ok && prepared.data?.hold === 'sending') { extensionUpdateHold = 'sending'; return; }
+    // A tool call started after the last status: the app holds the update at the last moment too.
+    if (prepared.ok && prepared.data?.hold === 'app-busy') { extensionUpdateHold = 'app-busy'; return; }
     if (!prepared.ok || prepared.data?.ready !== true || prepared.data.build !== offer.build) { extensionUpdateHold = 'folder-not-ready'; return; }
     extensionUpdateHold = null;
     await chrome.storage.local.set({ extensionReloadAttempt: attempt });
@@ -3291,7 +3462,7 @@ async function maintainOnce() {
   // The app decides whether there is recovery work; a worker holding no tabs is not a worker
   // with nothing to do, it is the one that has to open the chat the app is owed.
   if (token === null) {
-    await activeTabs?.revoke();
+    await renderingLeases(() => activeTabs?.revoke());
     if (!(await ensurePaired().catch(() => false)) || token === null) return;
   }
   const intent = connectionEpoch;
@@ -3326,7 +3497,7 @@ async function maintainOnce() {
     chatGptSignedIn: chatGptSignedInState, ...(typeof chatgptAccess === 'boolean' ? { chatgptAccess } : {}),
     ...(extensionUpdateHold ? { updateHold: extensionUpdateHold } : {}) }) });
   if (intent !== connectionEpoch || !token || disconnected) return;
-  if (!reply.ok || !reply.data) { await activeTabs?.revoke(); return; }
+  if (!reply.ok || !reply.data) { await renderingLeases(() => activeTabs?.revoke()); return; }
   await rememberBackgroundPlacement(reply.data.backgroundPlacement);
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);
   const liveOpenings = new Set(Array.isArray(reply.data.inputOpeningIds) ? reply.data.inputOpeningIds : []);
@@ -3379,8 +3550,11 @@ async function maintainOnce() {
   const refreshRendering = async (tabs) => {
     if (!activeTabs || intent !== connectionEpoch || !token || disconnected) return;
     tabs ||= await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    // Bounded, and never fatal to the pass: a lease is a debugger command to each background chat tab,
+    // and one that never answered, or failed to release, kept every later pass from reaching its repairs
+    // (2026-11-01: a Loop chat's repairs were handed out ten times and never claimed, twice).
     if (intent === connectionEpoch && token && !disconnected)
-      await activeTabs.set('policy', tabs.filter(renderingWanted), renderingWanted);
+      await renderingLeases(() => activeTabs.set('policy', tabs.filter(renderingWanted), renderingWanted));
   };
   // Reuse the app's current work policy. Old history, pins and tab presence do not qualify.
   await refreshRendering(observedTabs);
@@ -4177,8 +4351,12 @@ const HANDLERS = {
     return result;
   },
   async i18n_catalog(message) {
-    const messages = await globalThis.CLF_I18N?.catalogFor?.(String(message?.language || '')).catch(() => null);
-    return messages ? { ok: true, messages } : { ok: false };
+    // `current`: the language this worker applied from the app's last status (see followApp), so a
+    // page whose own storage read hangs still shows it.
+    const language = message?.current === true ? appLanguageApplied : String(message?.language || '');
+    if (!language) return { ok: false };
+    const messages = await globalThis.CLF_I18N?.catalogFor?.(language).catch(() => null);
+    return messages ? { ok: true, ...(message?.current === true ? { language } : {}), messages } : { ok: false };
   },
   async register_document(_message, sender) {
     let result = await registerDocument(sender, _message);
@@ -4299,7 +4477,7 @@ const HANDLERS = {
     // Remembered, not just cleared. Otherwise the next request — two seconds away in any
     // open tab — provisions a new token and the browser is connected again.
     disconnected = true;
-    await activeTabs?.revoke().catch(() => undefined);
+    await renderingLeases(() => activeTabs?.revoke());
     pairingError = null;
     await persist();
     return { ok: true };
@@ -4991,9 +5169,16 @@ async function cachedEnvironmentDiagnostics() {
 
 /** Snapshot sent only to the current paired bridge; it does not grant work or recovery. */
 async function companionDiagnosticSnapshot(found) {
-  const preferences = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
+  // Bounded like followApp's read: a storage that never answers must not hold every later report back.
+  await followSettled();
+  let readFailed = null;
+  const preferences = await boundedStorageGet([RENDER_STREAM_KEY, SHOW_TIMES_KEY, APP_LANGUAGE_KEY])
+    .catch(error => { readFailed = String(error?.message || error).slice(0, 200); return {}; });
+  const languageState = appLanguageState();
   return {
     capturedAt: Date.now(),
+    language: { ...languageState, error: languageState.error ?? readFailed,
+      stored: typeof preferences[APP_LANGUAGE_KEY] === 'string' ? preferences[APP_LANGUAGE_KEY] : null },
     status: {
       connected: found !== null,
       port: found ? found.port : null,
@@ -5175,7 +5360,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
       // minimized window for app-opened chats, 2026-10-15); a Send waiting there on its new
       // chat's address learns it now. Messages reach such a page at once; its timers do not.
       if (same) void tabReply(id, { type: 'clf-route-changed' }, { documentId }).catch(() => undefined);
-      await activeTabs?.navigation(id, same ? tab : null);
+      await renderingLeases(() => activeTabs?.navigation(id, same ? tab : null));
       if (rendering && same) return maintain(true);
     }).catch(() => undefined);
   }
