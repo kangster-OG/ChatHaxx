@@ -1,3 +1,4 @@
+import { DEFAULT_HANDOFF_LENGTH } from '../src/shared/handoff.js';
 import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_SYSTEM_PROMPT, DEFAULT_HANDOFF_PROMPT, catalogue, mountChat, projectSidebarFixture, settle, waitFor } from './renderer-state.harness.js';
 
@@ -353,10 +354,10 @@ it('closes a chat style editor when its text was stored although a later step of
   expect(mounted.state.config.ui.chatPersonality).toBe('Answer like a calm colleague.');
 });
 
-it('offers the handoff length, starting at the thorough default, and saves a shorter choice', async () => {
+it('offers the handoff length, starting at the default, and saves a shorter choice', async () => {
   const mounted = await mountChat({ hasGoalKey: true });
   const length = mounted.window.document.getElementById('handoffLength') as HTMLSelectElement;
-  expect(length.value).toBe('thorough');
+  expect(length.value).toBe(DEFAULT_HANDOFF_LENGTH);
   expect([...length.options].map(option => option.value)).toEqual(['thorough', 'standard', 'short']);
   length.value = 'short';
   length.dispatchEvent(new mounted.window.Event('change'));
