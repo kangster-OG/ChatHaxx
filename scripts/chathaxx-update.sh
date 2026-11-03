@@ -68,7 +68,8 @@ echo "source $version, installed $installed"
 [[ $version == "$installed" ]] && (( ! FORCE )) && { echo "RESULT: up to date"; exit 0; }
 
 step "build $version"
-[[ -d node_modules ]] || run npm-ci npm ci --no-audit --no-fund
+# Always reinstall: node_modules can predate a merge made by hand or in another checkout.
+run npm-ci npm ci --no-audit --no-fund
 run package npm run dist:dir:mac:arm64
 # The build regenerates this file from node_modules; keep the committed copy.
 git checkout -- THIRD-PARTY-NOTICES.txt
