@@ -13,6 +13,7 @@ import { CONNECTOR_SUFFIX_MAX, CONNECTOR_SUFFIX_PATTERN } from '../shared/connec
 import { displayLocalServer } from './local-url.js';
 import { paintPluginRefreshReminder } from './plugin-refresh-reminder.js';
 import { initRecordingStorageSetting, paintRecordingStorageNotice, paintRecordingStorageUsage } from './image-storage.js';
+import { paintAutomaticPause } from './automatic-pause.js';
 import { paintCredentialsNotice } from './credentials-notice.js';
 import { paintPluginRefreshOffer } from './plugin-refresh-offer.js';
 import { initUpdateReadiness, paintUpdateReadiness } from './update-readiness.js';
@@ -583,6 +584,87 @@ function desktopUnattributedRow(): HTMLElement {
   return row;
 }
 
+function linuxDesktopRow(): HTMLElement {
+  const row = el('label', 'tool linux-desktop-row');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.id = 'linuxDesktopEnabled';
+  input.addEventListener('change', () => void save());
+  const body = el('span');
+  body.append(el('strong', '', () => t('Allow native Linux Desktop access')),
+    el('em', '', () => t('Off by default. GNOME display screenshots require Screen permission and OS consent. Semantic accessibility actions require Control permission, a proven chat, and explicit approval when configured. No physical-input fallback.')));
+  row.append(input, body);
+  return row;
+}
+
+let linuxScreenshotConsentBusy = false;
+/** Only translate known, fixed main-process errors; never display arbitrary backend text. */
+function linuxScreenshotConsentErrorText(error: unknown): string {
+  switch (error) {
+    case 'Activate the Chat On Steroids window before requesting screenshot permission.':
+    case 'The Chat On Steroids window lost focus; no screenshot was requested.':
+      return t('Activate the Chat On Steroids window, then try again.');
+    case 'Enable native Linux Desktop and Screen access first.':
+    case 'Screen access was disabled before the screenshot request.':
+    case 'Native Linux Desktop or Screen access was disabled during the screenshot request.':
+      return t('Enable native Linux Desktop access and Screen permission, then try again.');
+    case 'Screenshot permission can be requested only from the Chat On Steroids main window.':
+      return t('Screenshot permission can be requested only from the Chat On Steroids main window.');
+    case 'A screenshot permission request is already running.':
+      return t('A screenshot permission request is already running.');
+    default:
+      return t('GNOME screenshot permission could not be confirmed.');
+  }
+}
+function linuxScreenshotConsentRow(): HTMLElement {
+  const row = el('div', 'tool is-static linux-consent-row');
+  const body = el('span');
+  body.append(
+    el('strong', '', () => t('Test GNOME screenshot permission')),
+    el('em', '', () => t('Click while the Chat On Steroids window is active. If GNOME asks, choose Allow. The screenshot is discarded.'))
+  );
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.id = 'linuxScreenshotConsent';
+  ui(button, 'textContent', () => t('Request screenshot permission'));
+  button.disabled = true;
+  const status = el('em', 'linux-consent-result');
+  status.id = 'linuxScreenshotConsentResult';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  button.addEventListener('click', async () => {
+    if (linuxScreenshotConsentBusy || button.disabled) return;
+    const hadFocus = document.activeElement === button;
+    linuxScreenshotConsentBusy = true;
+    button.disabled = true;
+    status.textContent = t('Waiting for GNOME screenshot permission…');
+    try {
+      const reply = await api.linuxScreenshotConsent();
+      status.textContent = reply.ok
+        ? t('Screenshot permission confirmed. No image was saved.')
+        : t('Screenshot permission request failed: {0}', [
+          linuxScreenshotConsentErrorText(reply.error)
+        ]);
+    } catch {
+      status.textContent = t('Screenshot permission request failed: {0}', [
+        t('GNOME screenshot permission could not be confirmed.')
+      ]);
+    } finally {
+      linuxScreenshotConsentBusy = false;
+      const config = state?.config;
+      button.disabled = !config || config.ui.linuxDesktopEnabled !== true || config.capabilities.screen !== true;
+      // A disabled button can drop keyboard focus. Restore it only when the
+      // person originally focused this button and has not moved elsewhere.
+      const active = document.activeElement;
+      if (hadFocus && !button.disabled && (!active || active === button ||
+          active === document.body || active === document.documentElement)) button.focus();
+    }
+  });
+  body.append(button, status);
+  row.append(body);
+  return row;
+}
+
 function buildGroups(): void {
   const permissionGroups = GROUPS.map((group) => {
     const box = document.createElement('input');
@@ -610,6 +692,7 @@ function buildGroups(): void {
       label.append(input, body);
       tools.append(label);
       if (cap === 'control') tools.append(desktopAskRow(), desktopUnattributedRow());
+      if (cap === 'screen') tools.append(linuxDesktopRow(), linuxScreenshotConsentRow());
     }
     tools.append(toolNames([]));
     if (group.id === 'run') tools.append(buildCommandAllowlist());
@@ -815,6 +898,7 @@ function save(over: { readOnly?: boolean; theme?: ThemeChoice; appearance?: Appe
       cosBrowserMinimize: $<HTMLSelectElement>('cosBrowserMinimize').value === 'tray' ? 'tray' : 'taskbar',
       desktopAsk: ($<HTMLSelectElement>('desktopAsk').value || 'off') as NonNullable<Config['ui']['desktopAsk']>,
       desktopUnattributed: $<HTMLInputElement>('desktopUnattributed').checked,
+      linuxDesktopEnabled: $<HTMLInputElement>('linuxDesktopEnabled').checked,
       finishTool: $<HTMLInputElement>('finishTool').checked,
       finishHoldOnStop: $<HTMLInputElement>('finishHoldOnStop').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
@@ -927,10 +1011,18 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     if (state && (!requestedSettings || requestedSettings.controlApi?.enabled === patch.controlApi?.enabled)) {
       $<HTMLInputElement>('controlApiEnabled').checked = state.config.controlApi?.enabled === true;
     }
+    // And for replies from Telegram, which let the phone message a chat: a box shown off while the saved
+    // value is still on would misstate it (CodeRabbit on #1990).
+    if (state && (!requestedSettings || requestedSettings.ui.phonePush?.telegramSteer === patch.ui.phonePush?.telegramSteer)) {
+      $<HTMLInputElement>('telegramSteer').checked = state.config.ui.phonePush?.telegramSteer === true;
+    }
     // And for desktop control without a known chat (CodeRabbit on #1938): a box shown off while the
     // saved value is still on would misstate what the desktop tools allow.
     if (state && (!requestedSettings || requestedSettings.ui.desktopUnattributed === patch.ui.desktopUnattributed)) {
       $<HTMLInputElement>('desktopUnattributed').checked = state.config.ui.desktopUnattributed === true;
+    }
+    if (state && (!requestedSettings || requestedSettings.ui.linuxDesktopEnabled === patch.ui.linuxDesktopEnabled)) {
+      $<HTMLInputElement>('linuxDesktopEnabled').checked = state.config.ui.linuxDesktopEnabled === true;
     }
     // And message times: a switch left on after a failed save would show what the setting hides.
     if (state && (!requestedSettings || requestedSettings.ui.showMessageTimes === patch.ui.showMessageTimes)) {
@@ -1711,6 +1803,7 @@ function apply(next: AppState): void {
   paintPluginRefreshRecovery(next);
   paintPluginRefreshReminder(next.connectorSchemas ?? {}, next.confirmedConnectorSchemas ?? {});
   paintRecordingStorageNotice(next.recordingStorageFull === true);
+  paintAutomaticPause(next.bridge.automaticPauseUntil ?? null);
   // A new size changes the "used of" line at once, not only when Settings opens again.
   if (previousState && previousState.config.sessions.storageLimitGiB !== next.config.sessions.storageLimitGiB) void paintRecordingStorageUsage();
   paintCredentialsNotice(next, api, apply);
@@ -1784,9 +1877,15 @@ function apply(next: AppState): void {
   applyValue($<HTMLSelectElement>('cosBrowserMinimize'), config.ui.cosBrowserMinimize ?? 'taskbar', previousState?.config.ui.cosBrowserMinimize ?? 'taskbar');
   applyValue($<HTMLSelectElement>('desktopAsk'), config.ui.desktopAsk ?? 'off', previousState?.config.ui.desktopAsk ?? 'off');
   applyChecked($<HTMLInputElement>('desktopUnattributed'), config.ui.desktopUnattributed === true, previousState?.config.ui.desktopUnattributed === true);
-  // The system says when it was last used only on macOS and Windows; elsewhere nothing would ask.
-  ($('desktopAsk').closest('.desktop-ask-row') as HTMLElement).hidden = !['macos', 'windows'].includes(next.platform?.family ?? 'macos');
-  ($('desktopUnattributed').closest('.desktop-unattributed-row') as HTMLElement).hidden = !['macos', 'windows'].includes(next.platform?.family ?? 'macos');
+  applyChecked($<HTMLInputElement>('linuxDesktopEnabled'), config.ui.linuxDesktopEnabled === true, previousState?.config.ui.linuxDesktopEnabled === true);
+  // The optional native approval row is available on Linux too; the gate
+  // stays disabled by default and conservatively asks when idle proof is absent.
+  ($('desktopAsk').closest('.desktop-ask-row') as HTMLElement).hidden = !['macos', 'windows', 'linux'].includes(next.platform?.family ?? 'macos');
+  ($('desktopUnattributed').closest('.desktop-unattributed-row') as HTMLElement).hidden = !['macos', 'windows', 'linux'].includes(next.platform?.family ?? 'macos');
+  ($('linuxDesktopEnabled').closest('.linux-desktop-row') as HTMLElement).hidden = next.platform?.family !== 'linux';
+  ($('linuxScreenshotConsent').closest('.linux-consent-row') as HTMLElement).hidden = next.platform?.family !== 'linux';
+  $<HTMLButtonElement>('linuxScreenshotConsent').disabled = linuxScreenshotConsentBusy ||
+    next.platform?.family !== 'linux' || config.ui.linuxDesktopEnabled !== true || config.capabilities.screen !== true;
   // Only the built-in browser has a window of the app's own to minimize.
   $('cosBrowserMinimizeRow').hidden = (config.ui.chatBrowser ?? 'chrome') !== 'cos';
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
@@ -3006,6 +3105,7 @@ for (const id of [
   'phonePushAway',
   'phonePushQuiet',
   'phonePushDetails',
+  'telegramSteer',
   'secretsShield',
   'tunnelKind',
   'tunnelId',

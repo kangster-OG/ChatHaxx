@@ -616,6 +616,32 @@ describe('direct browser control over the paired bridge', () => {
 });
 
 describe('who is allowed to talk to it', () => {
+  it('logs only bounded close-outbox decision codes and only once per extension report', async () => {
+    await pair();
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
+    const report = (action: string, reason: string, at: number) => request('POST', '/diagnostics', {
+      browser: 'aaaaaaaaaaaaaaaa',
+      body: { capturedAt: Date.now(), status: { connected: true, paired: true },
+        preferences: { overwrite: true, durations: false },
+        closeOutboxDecision: { at, action, reason } }
+    });
+    const lines = () => info.mock.calls.map(([line]) => String(line)).filter(line => line.startsWith('browser: deferred /closed:') ||
+      line.startsWith('browser: discarded stale /closed:'));
+    await report('deferred', 'chrome_tab_open', 10_000);
+    await report('deferred', 'chrome_tab_open', 10_000);
+    await report('deferred', 'chrome_inventory_unavailable', 10_001);
+    await report('discarded', 'conversation_binding_open', 10_002);
+    await report('deferred', 'user chat title; forged status', 10_003);
+    await report('constructor', 'chrome_tab_open', 10_004);
+    expect(lines()).toEqual([
+      'browser: deferred /closed: Chrome still has the conversation tab',
+      'browser: deferred /closed: Chrome tab inventory was unavailable',
+      'browser: discarded stale /closed: the conversation was rebound'
+    ]);
+    info.mockRestore();
+  });
+
   // 2026-10-30: an extension that kept Chrome's language for weeks said nothing anywhere.
   it('logs once when the extension\'s stored language is not the app\'s, with its last error', async () => {
     await pair();
@@ -742,6 +768,16 @@ describe('who is allowed to talk to it', () => {
     await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, language: 'en' } });
     const status = await request('POST', '/status', { body: { openConversations: [] } });
     expect(status.body).toMatchObject({ language: 'en', browserPreferences: { overwrite: false, durations: true } });
+  });
+
+  // 2026-11-01: the popup looks like the app: its colors for both themes and the theme it shows.
+  it('hands the app\'s theme and colors to the extension in /status', async () => {
+    await pair();
+    await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, theme: 'light' } });
+    const status = await request('POST', '/status', { body: { openConversations: [] } });
+    expect(status.body.appearance.theme).toBe('light');
+    expect(status.body.appearance.light['--page']).toMatch(/^#[0-9a-f]{6}$/i);
+    expect(status.body.appearance.dark['--accent-fill']).toMatch(/^#[0-9a-f]{6}$/i);
   });
 
   it('accepts only an exact plugin id or an exact missing report on /core-plugin', async () => {
@@ -3240,6 +3276,28 @@ describe('automatic compaction', () => {
     expect((await request('GET', '/status')).body.repairs.some((row: { token: string }) => row.token === handout.token)).toBe(true);
   });
 
+  // #2074: a page that kept answering "held" (the app's own Continue was back in its message box) used
+  // up the no-page budget, and recovery ended with "no page; not offering again" while that page was there.
+  it('never ends recovery as "no page" while the page keeps answering that it holds the repair, and logs a cleared leftover', async () => {
+    await pair();
+    const conversationId = randomUUID();
+    const session = await createSession({ conversationId });
+    await compactSession(session.id);
+    for (let pass = 0; pass < 15; pass++) {
+      const offered = (await request('GET', '/status')).body.repairs
+        .find((row: { conversationId: string }) => row.conversationId === conversationId);
+      expect(offered).toBeTruthy();
+      await request('GET', `/status?repairHeld=${encodeURIComponent(offered.token)}&why=draft`);
+    }
+    expect(getLog().some(entry => entry.message.includes(`${conversationId} never claimed`))).toBe(false);
+    const handout = (await request('GET', '/status')).body.repairs
+      .find((row: { conversationId: string }) => row.conversationId === conversationId);
+    // The report itself hands out no work, as for a held repair (CodeRabbit on #2079).
+    expect((await request('GET', `/status?repairCleared=${encodeURIComponent(handout.token)}`)).body.repairs).toEqual([]);
+    expect(getLog().some(entry => entry.message ===
+      `bridge: the page removed this app's own already-sent message, restored into ${conversationId}'s message box, before the compaction repair`)).toBe(true);
+  });
+
   it('says an app-started Compact & resume reloaded its chat to send the request, in a row naming that chat', async () => {
     await pair();
     const conversationId = randomUUID();
@@ -4327,6 +4385,47 @@ describe('automatic compaction', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // 2026-11-03 (Mac, 2 days): ChatGPT limited the chat's history, so its page never showed the latest
+  // tool results answered; every automatic attempt ended at that receipt, or a recovery reload cut the
+  // wait short, while the chat grew past its limit. The app now lets a later attempt ask without it.
+  it.each([
+    ['one attempt that waited the receipt out', ['results-unconfirmed'], true],
+    ['two attempts cut short', ['results-wait-changed', 'results-wait-changed'], false],
+    ['three attempts cut short', ['results-wait-changed', 'results-wait-changed', 'results-wait-changed'], true],
+    ['deferrals for other reasons', [null, null, null, null], false],
+    // This machine's own call kept the receipt from being checked: not a receipt miss (CodeRabbit on #2056).
+    ['attempts whose local call kept running', ['local-tools-running', 'local-tools-running', 'local-tools-running'], false]
+  ] as const)('asks for the handoff without the tool-result receipt after %s', async (_case, codes, waived) => {
+    await pair();
+    const conversationId = `a1a1a1a1-0000-4000-8000-0000000${String(codes.length)}${waived ? 'b' : 'c'}${codes[0] === null ? 'd' : codes[0] === 'local-tools-running' ? 'f' : 'e'}00`;
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'a long chat whose results ChatGPT never confirms', messageId: `m-${conversationId}` }] }
+    });
+    const first = await request('POST', '/compact', { body: { conversationId, ticket: true, automatic: true } });
+    expect(first.body.waiveReceipt).toBeUndefined();
+    const token = first.body.token as string;
+    for (const code of codes) {
+      expect((await request('POST', '/compact', { body: { conversationId, token, sourceDeferred: true,
+        sourceError: 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.', ...(code ? { sourceErrorCode: code } : {}) } })).status).toBe(200);
+    }
+    const again = await request('POST', '/compact', { body: { conversationId, ticket: true, automatic: true } });
+    expect(again.body.token).toBe(token);
+    expect(again.body.waiveReceipt === true).toBe(waived);
+    const lines = getLog().map(entry => entry.message).filter(line => line.includes(`compaction ticket ${token.slice(0, 8)}`) && line.includes('without ChatGPT\'s receipt'));
+    expect(lines).toHaveLength(waived ? 1 : 0);
+  });
+
+  it('never waives the receipt for a manual Compact & Resume', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac1f';
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'a manual press', messageId: 'm-manual-waive' }] }
+    });
+    const filed = await request('POST', '/compact', { body: { conversationId, ticket: true } });
+    await request('POST', '/compact', { body: { conversationId, token: filed.body.token, sourceDeferred: true, sourceError: 'x', sourceErrorCode: 'results-unconfirmed' } });
+    expect((await request('POST', '/compact', { body: { conversationId, ticket: true } })).body.waiveReceipt).toBeUndefined();
   });
 
   it('takes no deferral reason for a manual Compact & Resume', async () => {
@@ -8428,6 +8527,21 @@ ${SAMPLE_BRIEF}` }
       expect((await poll(other, [])).placement).toBeNull();
       expect((await poll(holder, [home])).placement).toMatchObject({ id: command.id, homeConversationId: home, active: true });
     });
+
+    // CodeRabbit on #2079: a repair report's reply is not read, so it must not spend a placement.
+    it('keeps a placement for the next poll when the browser only reports a repair', async () => {
+      await pair();
+      const home = 'c0c0c0c0-1111-4222-8333-000000000b04';
+      const { sessionId, token } = await compactedSession(home, 'carry on');
+      await poll(holder, [home]);
+      const command = queueResume(sessionId, token)!;
+      await vi.waitFor(async () => expect((await readDurable<any>('bridge-commands'))?.commands?.some((row: any) => row.id === command.id && row.phase === 'leased')).toBe(true), { timeout: 10_000 });
+      for (const report of ['repairCleared=some-token', 'repairHeld=some-token&why=draft', 'repairFailed=some-token&why=changed']) {
+        const reply = await request('POST', `/status?${report}`, { body: { openConversations: [home] }, browser: holder });
+        expect(reply.body.placement ?? null).toBeNull();
+      }
+      expect((await poll(holder, [home])).placement).toMatchObject({ id: command.id, homeConversationId: home, active: true });
+    });
   });
 
   it('never issues a second open while the handed-out browser tab is still hydrating', async () => {
@@ -8749,6 +8863,81 @@ describe('targeted open', () => {
       // The ticket survives, and the next pickup can carry the brief.
       const second = queueResume(sessionId, token)!;
       expect((await redeem(second.id, 'tab-2')).text).toContain('the stalled brief');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // #1882 (2026-11-02, a user's Windows log): ChatGPT did not open the source Project within a minute
+  // while it was limiting that chat's history. The app abandoned the finished brief, and the next
+  // automatic try had to write a new one. Nothing was sent, so the brief is kept and opened again.
+  it.each([
+    ['source-ready-timeout:last=source-not-ready', true, true],
+    ['transition-timeout:last=source-route', true, true],
+    ['user-interrupted', true, false],
+    ['source-ready-timeout:last=source-not-ready', false, false]
+  ] as const)('keeps the brief of a Compact & Resume whose new chat ChatGPT did not open in time (%s, automatic: %s)', async (detail, automatic, kept) => {
+    setBrowserOpener(async (url) => { opened.push(url); });
+    await pair();
+    const source = `68888888-7777-8888-9999-${automatic ? 'a' : 'b'}${kept ? 'c' : 'd'}${detail.slice(0, 1) === 's' ? 'e' : detail.slice(0, 1) === 't' ? 'f' : '0'}aaaaaaaa1`;
+    const { sessionId, token } = automatic ? await automaticCompactedSession(source, 'the kept brief') : await compactedSession(source, 'the kept brief');
+    const first = queueResume(sessionId, token)!;
+    await waitForOpened(1, 10_000);
+    expect((await redeem(first.id, 'tab-1')).text).toContain('the kept brief');
+    const prior = new Set(getLog());
+    const ack = await request('POST', '/commands/ack', { body: { id: first.id, client: 'tab-1', status: 'failed',
+      error: 'ChatGPT could not open the source Project through its native link; nothing was sent', detail: `project-entry:${detail}` } });
+    expect(ack.status).toBe(200);
+    expect(pendingCommands().some(entry => entry.id === first.id)).toBe(false);
+    expect(continuationByToken(token)?.state === 'aborted').toBe(!kept);
+    expect(getLog().some(entry => !prior.has(entry) && entry.message.includes('the brief is kept and the new chat is opened again at the next pickup'))).toBe(kept);
+    if (!kept) return;
+    expect(continuationByToken(token)).toMatchObject({ destinationSend: { state: 'not-attempted' } });
+    // The same brief, not a new one, goes to the next attempt.
+    const second = queueResume(sessionId, token)!;
+    expect(second.id).not.toBe(first.id);
+    expect((await redeem(second.id, 'tab-2')).text).toContain('the kept brief');
+  });
+
+  // #1882: after its three quick tries, an automatic ticket with a written brief stopped trying to
+  // open its new chat at all, and while open it owns the chat's recovery: the chat stopped for good.
+  it('keeps opening the new chat of an automatic Compact & Resume once an hour after its quick tries', async () => {
+    vi.useFakeTimers();
+    try {
+      setBrowserOpener(async (url) => { opened.push(url); });
+      await pair();
+      const { sessionId, token } = await automaticCompactedSession('69999999-7777-8888-9999-aaaaaaaaaaa1', 'the hourly brief');
+      const resumes = () => pendingCommands().filter(entry => entry.what.startsWith('resume:'));
+      const fail = async () => {
+        const [command] = resumes();
+        expect(command, 'a resume is offered').toBeTruthy();
+        expect((await redeem(command!.id, `tab-${command!.id}`)).text).toContain('the hourly brief');
+        await request('POST', '/commands/ack', { body: { id: command!.id, client: `tab-${command!.id}`, status: 'failed',
+          error: 'nothing was sent', detail: 'project-entry:source-ready-timeout:last=source-not-ready' } });
+        expect(resumes()).toHaveLength(0);
+      };
+      // Whatever offered the first one, three quick pickups follow, each 15 minutes apart.
+      if (resumes().length) await fail();
+      await sweepStaleSwarm(Date.now()); // the opening phase's clock starts here
+      for (let quick = 0; quick < 3; quick++) {
+        await vi.advanceTimersByTimeAsync(15 * 60_000 + 1_000);
+        await sweepStaleSwarm(Date.now());
+        await fail();
+      }
+      // Then not every 15 minutes, but once an hour, said once: three hours swept every 5 minutes.
+      const offeredAt: number[] = [];
+      for (let step = 0; step < 36; step++) {
+        await vi.advanceTimersByTimeAsync(5 * 60_000);
+        await sweepStaleSwarm(Date.now());
+        if (resumes().length) { offeredAt.push(Date.now()); await fail(); }
+      }
+      expect(offeredAt.length).toBeGreaterThanOrEqual(2);
+      expect(offeredAt.length).toBeLessThanOrEqual(3);
+      for (let at = 1; at < offeredAt.length; at++) expect(offeredAt[at]! - offeredAt[at - 1]!).toBe(60 * 60_000);
+      expect(getLog().filter(entry => entry.message.includes('could not open its new chat after 3 pickups — trying once an hour'))).toHaveLength(1);
+      expect(continuationByToken(token)?.state).not.toBe('aborted');
+      expect(getLog().filter(entry => entry.message.includes('trying once an hour'))).toHaveLength(1);
+      void sessionId;
     } finally {
       vi.useRealTimers();
     }
@@ -9801,6 +9990,27 @@ describe('unattributed activity recovery', () => {
     await maintenance(retry!.token, 'reloaded');
     await events(OTHER, [{ kind: 'chat_error', time: Date.now(), turnId: 'h2-turn', text: 'another notice', recoverable: true, reason: 'stream_gone' }]);
     expect(await maintenance()).toBeNull();
+  });
+
+  // CodeRabbit on #2080: a finished repair that keeps no activity grant is no work for history Retry.
+  it('stops counting a finished repair as work once its chat keeps no activity grant', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await events(OTHER, [{ kind: 'user_message', time: Date.now(), messageId: 'retry-done-question', text: 'Work on this task.' }, openTurn('retry-done-turn')]);
+      await events(OTHER, [{ kind: 'chat_error', time: Date.now(), turnId: 'retry-done-turn', text: 'The response stream is unavailable.',
+        recoverable: true, reason: 'stream_gone' }]);
+      const repair = await maintenance();
+      expect(repair).toMatchObject({ conversationId: OTHER, reason: 'assistant-error' });
+      expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(true);
+      await maintenance(repair!.token, 'reloaded');
+      await events(OTHER, [{ kind: 'turn_end', time: Date.now(), turnId: 'retry-done-turn', outcome: 'completed' }]);
+      const view = async () => (await request('GET', `/activity?conversationId=${OTHER}`)).body.historyRetry;
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(await view()).toEqual({ wanted: false });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('lets the user cancel an interrupted-response reload for this answer only (#1032)', async () => {
@@ -12084,6 +12294,26 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  // #2076: each Retry press is another history request; an idle chat leaves it to the person.
+  it('tells the page to press history Retry only while work waits, and not inside the app hold', async () => {
+    await pair();
+    await events(PRIME, [{ kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' }]);
+    const view = async () => (await request('GET', `/activity?conversationId=${PRIME}`)).body.historyRetry;
+    expect(await view()).toEqual({ wanted: false });
+    // A running call no chat is proven to own is not this chat's work (CodeRabbit on #2080).
+    const { trackInFlight, emptyEvidence } = await import('../src/main/mcp/call-context.js');
+    await trackInFlight({ startedAt: Date.now(), transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),
+      caller: { conversationId: null, requestId: 'no-chat-call', transportKey: null } }, async () => {
+      expect(await view()).toEqual({ wanted: false });
+    });
+    await events(PRIME, [openTurn('retry-work')]);
+    expect(await view()).toMatchObject({ wanted: true });
+    const retryAt = Date.now() + 10 * 60_000;
+    await events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'retry-work', recoverable: false, blocking: true, retryAt,
+      text: 'ChatGPT temporarily rate-limited loading this conversation history.' }]);
+    expect((await view()).until).toBeGreaterThanOrEqual(retryAt);
+  });
+
   it('records a repeating history limit once, while its deadline keeps following the newest (2026-10-11)', async () => {
     // A throttled history answered every retry with the same limit: eight identical blocking notices
     // stacked up in eight minutes. One notice says it; the hold still follows each new Retry-After.
@@ -12196,21 +12426,23 @@ describe('unattributed activity recovery', () => {
       // A second limit while the first still holds is the same episode, not a failed retry.
       await vi.advanceTimersByTimeAsync(30_000);
       expect(await limited(60_000)).toBe(60_000);
-      // Each retry that is limited again waits longer: 2, 4, 8, then 15 minutes, and stays there.
-      for (const expected of [120_000, 240_000, 480_000, 900_000, 900_000]) {
+      // Each retry that is limited again waits longer: 2, 4, 8, 15, 30, then 60 minutes, and stays
+      // there. A limit that outlasted a quarter-hour cadence for 8.5 hours (#1882, 2026-11-05) gets
+      // fewer tries the longer it lasts, not one every 25 minutes forever.
+      for (const expected of [120_000, 240_000, 480_000, 900_000, 1_800_000, 3_600_000, 3_600_000]) {
         const [hold] = (await sessionControlsFor(session.id)).recovery ?? [];
         await vi.advanceTimersByTimeAsync(hold!.deadline - Date.now() + 1_000);
         expect(await limited(60_000)).toBe(expected);
       }
       // Each longer hold says why in the log, once per failed retry.
       expect(getLog().filter(entry => entry.message.includes(`${PRIME} history was limited again after its wait`))
-        .map(entry => /holding automatic recovery (\d+) minutes/.exec(entry.message)?.[1])).toEqual(['2', '4', '8', '15', '15']);
+        .map(entry => /holding automatic recovery (\d+) minutes/.exec(entry.message)?.[1])).toEqual(['2', '4', '8', '15', '30', '60', '60']);
       // A longer Retry-After from ChatGPT still wins.
       const [held] = (await sessionControlsFor(session.id)).recovery ?? [];
       await vi.advanceTimersByTimeAsync(held!.deadline - Date.now() + 1_000);
-      expect(await limited(20 * 60_000)).toBe(20 * 60_000);
+      expect(await limited(90 * 60_000)).toBe(90 * 60_000);
       // A limit that comes back after a quiet quarter of an hour starts over.
-      await vi.advanceTimersByTimeAsync(20 * 60_000 + 15 * 60_000 + 1_000);
+      await vi.advanceTimersByTimeAsync(90 * 60_000 + 15 * 60_000 + 1_000);
       expect(await limited(60_000)).toBe(60_000);
     } finally { vi.useRealTimers(); }
   });
@@ -16835,6 +17067,37 @@ describe('the goal loop over the bridge', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  // 2026-11-03 (Mac): the person's Continue reached the chat's page, which held it while ChatGPT still
+  // answered; a minute later the app failed it as "the browser did not pick up this message".
+  it('keeps a queued message the chat\'s page holds until ChatGPT\'s answer ends, and fails it only once no page holds it', async () => {
+    vi.useFakeTimers();
+    const input = await import('../src/main/session/input.js');
+    const { resetInputForTests, enqueueInput, listInputs } = input;
+    resetInputForTests();
+    const id = 'abca1103-0000-4000-8000-000000001103';
+    try {
+      await writeDurableNow('session-input', []);
+      await pair();
+      const chat = 'cafe1103-0000-4000-8000-000000001103';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'work', messageId: 'held-user' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'held-turn' },
+        { kind: 'turn_end', time: Date.now(), turnId: 'held-turn', outcome: 'completed' }
+      ] } });
+      const session = (await findSessionByConversation(chat, { requireUnique: true }))!;
+      await enqueueInput({ id, sessionId: session.id, text: 'Continue', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null });
+      const row = async () => (await listInputs()).find(entry => entry.id === id);
+      expect((await row())?.transportIntent).toBe('browser');
+      for (let step = 0; step < 4; step++) {
+        await vi.advanceTimersByTimeAsync(40_000);
+        expect((await request('POST', '/page-note', { body: { note: 'input-held', reason: 'still-answering', inputId: id, conversationId: chat } })).body).toEqual({ ok: true });
+        expect(await row()).toMatchObject({ state: 'queued', pageHold: { reason: 'still-answering' } });
+      }
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(await row()).toMatchObject({ state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+    } finally { resetInputForTests(); vi.useRealTimers(); }
+  });
+
   // 2026-10-31: an automatic Continue the app itself withheld was "uncollected"; the pickup reloaded the
   // chat three times for it, stopped, and nothing said which gate held it. A page cannot claim what is
   // not offered, so no reload is spent, and the log names the gate.
@@ -18039,6 +18302,26 @@ describe('app requests to stop one exact active turn', () => {
     const activity = await request('GET', `/activity?conversationId=${conversationId}`);
     expect(activity.body.stopTurn).toEqual({ turnId: 'unanchored-turn', userMessageId: null });
   });
+  // #1882: a Stop that turned Loop off could not be told apart from the app's button or the control API.
+  it('names who sent a Stop, in its log line and in the Loop it turned off', async () => {
+    const { stopSessionTurn, setSessionAutomation } = await import('../src/main/bridge.js');
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
+    const conversationId = 'e9999999-aaaa-4bbb-8ccc-111111111111';
+    const sessionId = await active(conversationId, 'sent-turn');
+    await setSessionAutomation(sessionId, 'loop', undefined, 'the app');
+    await stopSessionTurn(sessionId, 'sent-turn', { from: 'the control API' });
+    const lines = info.mock.calls.map(([line]) => String(line));
+    expect(lines).toContain(`goal: ${conversationId} switched to loop by the app`);
+    expect(lines).toContain(`goal: ${conversationId} switched to Normal by a Stop sent by the control API`);
+    expect(lines.some(line => line.startsWith(`bridge: desktop (sent by the control API) Stop requested for session ${sessionId}`))).toBe(true);
+    // A second Stop of the same answer joins the queued one, and still says who sent it.
+    info.mockClear();
+    await stopSessionTurn(sessionId, 'sent-turn');
+    expect(info.mock.calls.map(([line]) => String(line))
+      .some(line => line.startsWith(`bridge: desktop (sent by the app) Stop for session ${sessionId}`) && line.includes('joins the Stop already requested'))).toBe(true);
+    info.mockRestore();
+  });
   it('hands a new Stop to the shared absent-browser startup owner once and revokes it for a newer turn', async () => {
     const { stopSessionTurn } = await import('../src/main/bridge.js');
     const conversationId = 'e8888888-aaaa-4bbb-8ccc-111111111111';
@@ -18126,6 +18409,41 @@ describe('app requests to stop one exact active turn', () => {
     expect((await request('GET', '/status')).body.stopTurns).toEqual([]);
     expect((await getSession(sessionId))?.activeTurnId).toBe('stop-turn-two');
     expect((await getSession(sessionId))?.finishTurn?.released).toBe(false);
+  });
+  it('ends the app\'s own Loop when Stop names a turn no longer running, and asks ChatGPT to stop nothing (Haz on #1883)', async () => {
+    const { stopSessionTurn, endOwnWorkAfterStop, sessionControlsFor } = await import('../src/main/bridge.js');
+    const sessionId = await active(randomUUID());
+    await setSessionAutomation(sessionId, 'loop');
+    await expect(stopSessionTurn(sessionId, 'gone-turn')).rejects.toThrow('active_turn_changed');
+    expect(await endOwnWorkAfterStop(sessionId, 'gone-turn')).toEqual({ ended: true, resumeGoesOn: false });
+    expect((await sessionControlsFor(sessionId)).automation).toBe('off');
+    expect((await request('GET', '/status')).body.stopTurns).toEqual([]);
+    // Nothing of the app's own left: it says so.
+    expect(await endOwnWorkAfterStop(sessionId, 'gone-turn')).toEqual({ ended: false, resumeGoesOn: false });
+  });
+  it('changes nothing in a chat the session moved to, and counts a Loop the Stop path already turned off (CodeRabbit on #2066)', async () => {
+    const { endOwnWorkAfterStop, sessionControlsFor } = await import('../src/main/bridge.js');
+    const conversationId = randomUUID();
+    const sessionId = await active(conversationId);
+    await setSessionAutomation(sessionId, 'loop');
+    // Stop was pressed for another chat than the session's current one: nothing here changes.
+    expect(await endOwnWorkAfterStop(sessionId, 'gone-turn', { conversationId: randomUUID(), automation: 'loop' })).toEqual({ ended: false, resumeGoesOn: true });
+    expect((await sessionControlsFor(sessionId)).automation).toBe('loop');
+    // Stop found Loop on, and its own path turned it off before finding the turn gone: that still counts.
+    await setSessionAutomation(sessionId, 'off');
+    expect(await endOwnWorkAfterStop(sessionId, 'gone-turn', { conversationId, automation: 'loop' })).toEqual({ ended: true, resumeGoesOn: false });
+  });
+  it('turns off a Goal armed only by its objective when Stop names a turn no longer running (CodeRabbit on #2066)', async () => {
+    const { endOwnWorkAfterStop, sessionControlsFor } = await import('../src/main/bridge.js');
+    const { setGoalObjectiveNow, goalSwitchFor } = await import('../src/main/goal.js');
+    const conversationId = randomUUID();
+    const sessionId = await active(conversationId);
+    // An objective with no switch of its own arms Goal; the switch itself was never turned on.
+    await setGoalObjectiveNow(conversationId, 'Finish the quarterly report');
+    expect(goalSwitchFor(conversationId).enabled).toBe(false);
+    expect((await sessionControlsFor(sessionId)).automation).not.toBe('off');
+    expect(await endOwnWorkAfterStop(sessionId, 'gone-turn')).toEqual({ ended: true, resumeGoesOn: false });
+    expect((await sessionControlsFor(sessionId)).automation).toBe('off');
   });
   it('offers Stop for a turn the page still holds after the app stopped counting it as work (2.1.47 round)', async () => {
     // Seen 2026-10-28: ChatGPT stopped loading a chat's history, the page kept its turn open, so it
@@ -18425,15 +18743,51 @@ describe('selecting a chat in the app selects its background tab (#1249)', () =>
     } finally { await close(socket); }
   });
 
+  it('withdraws a queued tab follow when the selected chat becomes New Chat', async () => {
+    await pair();
+    await background(true);
+    const socket = await connect();
+    try {
+      await poll(BROWSER_B, [CHAT]);
+      followChatInBackground(CHAT);
+      followChatInBackground(null);
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
+      followChatInBackground(CHAT);
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBe(CHAT);
+    } finally { await close(socket); }
+  });
+
   it('asks for nothing with Background chats off', async () => {
     await pair();
     await background(false);
     const socket = await connect();
     try {
       await poll(BROWSER_B, [CHAT]);
-      followChatInBackground(CHAT);
+      const logger = await import('../src/main/logger.js');
+      const info = vi.spyOn(logger, 'logInfo');
+      try {
+        followChatInBackground(CHAT);
+        expect(info).toHaveBeenCalledWith('browser follow: skipped, background chats are disabled');
+      } finally { info.mockRestore(); }
       expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
     } finally { await close(socket); await background(true); }
+  });
+
+  it('reports a disconnected browser so the renderer can retain and retry its pending selection', async () => {
+    await pair();
+    await background(true);
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
+    try {
+      expect(followChatInBackground(CHAT)).toBe(false);
+      expect(info).toHaveBeenCalledWith('browser follow: deferred, no connected browser can reveal tabs; renderer may retry while pending');
+    } finally { info.mockRestore(); }
+    const socket = await connect();
+    try {
+      await poll(BROWSER_B, [CHAT]);
+      expect(followChatInBackground(CHAT)).toBe(true);
+      expect((await poll(BROWSER_B, [CHAT])).follow).toBe(CHAT);
+    } finally { await close(socket); }
   });
 
   it('lets an old selection lapse instead of acting on it later', async () => {
@@ -18464,7 +18818,12 @@ describe('selecting a chat in the app selects its background tab (#1249)', () =>
     const socket = await connect();
     try {
       await poll(BROWSER_B, [CHAT]);
-      followChatInBackground(CHAT);
+      const logger = await import('../src/main/logger.js');
+      const info = vi.spyOn(logger, 'logInfo');
+      try {
+        followChatInBackground(CHAT);
+        expect(info).toHaveBeenCalledWith('browser follow: skipped, background tabs are grouped');
+      } finally { info.mockRestore(); }
       expect((await poll(BROWSER_B, [CHAT])).follow).toBeUndefined();
     } finally { await close(socket); await placement('window'); }
   });
@@ -18680,6 +19039,47 @@ describe('a chat deleted in ChatGPT', () => {
       input.resetInputForTests();
       await writeDurableNow('session-input', []);
     }
+  });
+});
+
+// #1990: whoever switches a chat's Goal or Loop is told to the listeners, so Telegram's pause marker can end
+// when the person's own control changes the switch.
+describe('a chat that holds a turn', () => {
+  it('holds one only while the live recorder still has that turn, never because of a stored open turn alone (#1990)', async () => {
+    await pair();
+    const { sessionHoldsTurn } = await import('../src/main/bridge.js');
+    const conversationId = randomUUID();
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', time: Date.now(), text: 'Work on it', messageId: 'hold-question' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'hold-turn' }
+    ] } });
+    const session = (await findSessionByConversation(conversationId))!;
+    expect(session.activeTurnId).toBe('hold-turn');
+    expect(sessionHoldsTurn(session)).toBe(true);
+    expect(sessionHoldsTurn({ ...session, browserRecoveryDismissedAt: Date.now() })).toBe(false);
+    expect(sessionHoldsTurn({ ...session, activeTurnId: 'another-turn' })).toBe(false);
+    expect(sessionHoldsTurn({ ...session, conversationId: null as never })).toBe(false);
+    // The recorder forgot the turn (an app restart): the stored record still names it, and that is history.
+    resetRecorderForTests();
+    expect(sessionHoldsTurn((await getSession(session.id))!)).toBe(false);
+  });
+});
+
+describe('a chat\'s Goal or Loop switch', () => {
+  it('tells its listeners who switched it on or off, and a failing listener never fails the switch', async () => {
+    const { onSessionAutomationChange, setSessionAutomation } = await import('../src/main/bridge.js');
+    const session = await createSession({ conversationId: randomUUID() });
+    const heard: Array<[string, boolean, string | undefined]> = [];
+    const stop = onSessionAutomationChange((id, on, from) => { heard.push([id, on, from]); });
+    const stopFailing = onSessionAutomationChange(() => { throw new Error('listener bug'); });
+    try {
+      await setSessionAutomation(session.id, 'loop', undefined, 'the app');
+      await setSessionAutomation(session.id, 'off', undefined, 'Telegram');
+      expect(heard).toEqual([[session.id, true, 'the app'], [session.id, false, 'Telegram']]);
+    } finally { stop(); stopFailing(); await setSessionAutomation(session.id, 'off').catch(() => undefined); }
+    await setSessionAutomation(session.id, 'loop');
+    expect(heard).toHaveLength(2);
+    await setSessionAutomation(session.id, 'off');
   });
 });
 

@@ -185,6 +185,8 @@ const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   // Preserve the historical behavior unless the user explicitly opts into a cap shared by
   // independent prime families. Existing per-family maxWorkers remains authoritative too.
   globalMaxWorkers: 0,
+  // Off: automatic sends go out as soon as their chat is ready, however many chats work (#1694).
+  chatsAtOnce: 0,
   allowUnattributedCalls: false,
   strictChatAllowlist: false,
   // Off: Goal/Loop chats are always recovered, and reopening anything else — a worker, a prime,
@@ -378,6 +380,11 @@ const configSchema = z.object({
       logWarn('config: the saved ui.desktopUnattributed was damaged; desktop control is used only for chats the app can name until it is chosen again');
       return undefined;
     }),
+    /** Browser screen/control grants never opt Linux into native AT-SPI or portal access. */
+    linuxDesktopEnabled: z.boolean().default(false).catch(() => {
+      logWarn('config: the saved ui.linuxDesktopEnabled was damaged; native Linux Desktop access remains off');
+      return false;
+    }),
     developerMode: z.boolean().optional(),
     playfulStatus: z.boolean().optional(),
     playfulContinue: z.boolean().optional(),
@@ -455,6 +462,8 @@ const configSchema = z.object({
       return { ...raw, enabled: false, server: '' };
     }, z.object({
       enabled: z.boolean().catch(false),
+      // ntfy as a destination; Telegram (#1934) is the other. Settings from before Telegram: on.
+      ntfy: z.boolean().optional().default(true).catch(true),
       server: z.string().max(2048).optional().default(DEFAULT_PHONE_PUSH.server).catch(''),
       topic: z.string().max(64).catch(''),
       needsYou: z.boolean().catch(true),
@@ -462,7 +471,9 @@ const configSchema = z.object({
       finishedAfterMinutes: z.number().int().min(0).max(240).nullable().catch(DEFAULT_PHONE_PUSH.finishedAfterMinutes),
       onlyWhenAway: z.boolean().catch(true),
       quietHours: z.object({ from: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), to: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/) }).nullable().catch(null),
-      includeDetails: z.boolean().catch(false)
+      includeDetails: z.boolean().catch(false),
+      // Replies from Telegram as messages (phase 2, 2026-10-31): missing or damaged is off.
+      telegramSteer: z.boolean().optional().catch(undefined)
     })).optional().catch(undefined),
     // Masking credentials in tool output before ChatGPT sees them (#1797). On unless turned off.
     secretsShield: z.boolean().optional().default(true),
@@ -530,6 +541,7 @@ const configSchema = z.object({
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
       maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers),
       globalMaxWorkers: z.number().int().min(0).max(64).optional().default(DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0),
+      chatsAtOnce: z.number().int().min(0).max(10).optional().catch(0).default(DEFAULT_MULTI_AGENT.chatsAtOnce ?? 0),
       allowUnattributedCalls: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedCalls),
       strictChatAllowlist: z.boolean().optional().default(DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false),
       recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs),
@@ -543,6 +555,7 @@ const configSchema = z.object({
       enabled: DEFAULT_MULTI_AGENT.enabled,
       maxWorkers: DEFAULT_MULTI_AGENT.maxWorkers,
       globalMaxWorkers: DEFAULT_MULTI_AGENT.globalMaxWorkers ?? 0,
+      chatsAtOnce: DEFAULT_MULTI_AGENT.chatsAtOnce ?? 0,
       allowUnattributedCalls: DEFAULT_MULTI_AGENT.allowUnattributedCalls,
       strictChatAllowlist: DEFAULT_MULTI_AGENT.strictChatAllowlist ?? false,
       recoverAgentTabs: DEFAULT_MULTI_AGENT.recoverAgentTabs,
@@ -694,7 +707,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     // Fresh installs refresh changed connector tools on their own: a permission chosen in Setup
     // changes the tool list, and nothing else tells a new user to refresh the plugin in ChatGPT.
     // Older configs keep the schema default (off).
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, sounds: false, rotateTurnMinutes: 30, rotateStopFallback: true, rotateStopFallbackAdopted: true, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false,
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, sounds: false, rotateTurnMinutes: 30, rotateStopFallback: true, rotateStopFallbackAdopted: true, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false, linuxDesktopEnabled: false,
       // The built-in browser is opt-in: Chrome with the companion stays the default for new and
       // existing installs alike, and the built-in one runs only once someone chooses it.
       chatBrowser: 'chrome' },

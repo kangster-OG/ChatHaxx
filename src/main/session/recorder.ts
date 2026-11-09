@@ -30,7 +30,8 @@ import type {
   ToolOutcome,
   TurnOutcome
 } from '../../shared/session.js';
-import { estimateTokens, isUnattributedSession, originTitle, UNATTRIBUTED_SESSION_TITLE } from '../../shared/session.js';
+import { CHAT_ACTIVE_MS, estimateTokens, isUnattributedSession, originTitle, UNATTRIBUTED_SESSION_TITLE } from '../../shared/session.js';
+import { isProModel } from '../../shared/chat-models.js';
 import { chatErrorMessageKey } from '../../shared/chat-error.js';
 import { continuedRequestTurn, overlappingRequestTurns, recordedRequestTurn, responseTurnId, turnOpenAt } from '../../shared/chronology.js';
 import { getConfig } from '../config.js';
@@ -75,6 +76,7 @@ import {
   awaitRequestCorrelation,
   commitRequestCorrelations,
   observeRequestCorrelations,
+  onRequestCorrelation,
   requestCorrelation,
   resetCorrelationRegistryForTests,
 } from './correlation.js';
@@ -119,6 +121,11 @@ interface LiveConversation {
   /** ChatGPT request ids — one per server turn — that called tools while the open turn ran. */
   turnRequestIds: Set<string>;
   /**
+   * #2082: a turn the person stopped that a late call reopened. When its calls stop, the app ends
+   * it as stopped again itself, so a hidden or reloaded page cannot leave it open for good.
+   */
+  reopenedStop?: { turnId: string; lastCallAt: number; timer: ReturnType<typeof setTimeout> | null; pro: boolean; outcome: 'stopped' | 'completed' } | null;
+  /**
    * The newest turn the page reported ended, with the server requests it was calling under.
    *
    * A request id is minted per server turn and outlives anything the page does: a reload,
@@ -128,7 +135,9 @@ interface LiveConversation {
    * finished. See reopenFalselyEndedTurn. After restart the durable request-turn index can
    * restore this proof only from calls recorded before the reported end.
    */
-  endedTurn: { turnId: string; startedAt: number | null; endedAt: number; requestIds: Set<string> } | null;
+  endedTurn: { turnId: string; startedAt: number | null; endedAt: number; requestIds: Set<string>;
+    /** What ended this turn, kept with it: `lastTurnOutcome` can be overwritten by a recovered Goal verdict (#2103). */
+    outcome?: TurnOutcome } | null;
   /** Visible ChatGPT-native activity rows, updated by the page's stable row identity. */
   pageTools: Map<string, ProgressRecord>;
 }
@@ -832,6 +841,10 @@ function retryFailedAttributionRepair(): void {
   attributionRepairTimer.unref?.();
 }
 
+// Native page proof already schedules repair in noteCallEvidence. Provider-session proof
+// can arrive independently of page observations and must use that same repair owner.
+onRequestCorrelation(owner => { if (owner.providerSessionAnchor) scheduleAttributionRepair(owner.requestId); });
+
 /**
  * Feeds the one request-correlation registry.
  *
@@ -982,17 +995,21 @@ async function repairAttributionNow(affected?: ReadonlySet<string>): Promise<{ s
   let storageFailed = false;
 
   for (const summary of await indexedSessions()) try {
-    if ((summary.provisionalToolCalls ?? 0) > 0) {
+    if ((summary.provisionalToolCalls ?? 0) > 0 || (summary.providerSessionToolCalls ?? 0) > 0) {
       const events = await readEvents(summary.id, { kinds: ['tool_call'] });
       let repaired = 0;
       for (const event of events) {
-        if (event.kind !== 'tool_call' || event.call.attributionMethod !== 'generation' || !event.call.requestId) continue;
+        if (event.kind !== 'tool_call' || event.call.attributionMethod !== 'generation' && !event.call.providerSessionAnchor || !event.call.requestId) continue;
         try {
           const proof = requestCorrelation(event.call.requestId);
           if (!proof || !await getSession(proof.sessionId)) continue;
+          if (event.call.providerSessionAnchor && proof.providerSessionAnchor === event.call.providerSessionAnchor &&
+            proof.sessionId === summary.id && proof.conversationId === event.call.conversationId) continue;
           const same = proof.sessionId === summary.id;
           const corrected = { ...event, call: { ...event.call, conversationId: proof.conversationId,
             attribution: 'request_id' as const, attributionMethod: 'request_id' as const } };
+          if (proof.providerSessionAnchor) corrected.call.providerSessionAnchor = proof.providerSessionAnchor;
+          else delete corrected.call.providerSessionAnchor;
           // A provisional turn cannot establish an exact turn in a different conversation.
           if (!same || proof.conversationId !== event.call.conversationId) delete corrected.turnId;
           if (!same) {
@@ -1015,7 +1032,7 @@ async function repairAttributionNow(affected?: ReadonlySet<string>): Promise<{ s
             const existing = await readEvents(proof.sessionId, { kinds: ['tool_call'] });
             if (!existing.some(row => row.kind === 'tool_call' && row.call.callId === event.call.callId)) {
               const { seq: _seq, ...copy } = corrected;
-              await (copy.call.process ? recordProcessCall : appendEvent)(proof.sessionId, copy);
+              await (copy.call.process || copy.call.providerSessionAnchor ? recordProcessCall : appendEvent)(proof.sessionId, copy);
               changed.add(proof.sessionId);
             }
           }
@@ -1133,7 +1150,8 @@ async function repairAttributionNow(affected?: ReadonlySet<string>): Promise<{ s
         );
         for (const { event, conversationId } of group) {
           if (existingCallIds.has(event.call.callId)) continue;
-          await appendEvent(targetSessionId, {
+          const providerAnchor = event.call.requestId ? requestCorrelation(event.call.requestId)?.providerSessionAnchor : undefined;
+          await (providerAnchor ? recordProcessCall : appendEvent)(targetSessionId, {
             time: event.time,
             source: 'mcp',
             kind: 'tool_call',
@@ -1141,7 +1159,8 @@ async function repairAttributionNow(affected?: ReadonlySet<string>): Promise<{ s
               ...event.call,
               attribution: 'request_id',
               conversationId,
-              attributionMethod: 'request_id'
+              attributionMethod: 'request_id',
+              ...(providerAnchor ? { providerSessionAnchor: providerAnchor } : {})
             },
             ...(event.agent ? { agent: event.agent } : {}),
             ...(event.turnId ? { turnId: event.turnId } : {})
@@ -1306,6 +1325,8 @@ export interface ToolContentPart {
 }
 
 export interface ToolCallInput {
+  /** Provenance captured at admission, retained if native proof changes during execution. */
+  providerSessionAnchor?: string;
   /** Captured before the handler. Presentation only; never binds caller or agent identity. */
   recordingContext?: RecordingContext | null;
   /** Proven by dispatcher nesting, never inferred from request ids or timing. */
@@ -1440,6 +1461,12 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
       attribution: 'request_id',
       turnId: live?.turnId ?? null
     };
+    if (input.providerSessionAnchor) {
+      target.conversationId = correlation?.conversationId ?? null;
+      target.sessionId = correlation?.sessionId ?? null;
+      target.attribution = correlation ? 'request_id' : 'unattributed';
+      if (target.conversationId !== input.conversationId) target.turnId = null;
+    }
     if (input.bind) bindAgentConversation(input.bind, input.conversationId);
     attributing = Promise.resolve(target);
   } else {
@@ -1651,6 +1678,8 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       callId: randomUUID(),
       tool: input.tool,
       attribution: target.attribution,
+      ...(target.attribution === 'request_id' && input.requestId && requestCorrelation(input.requestId)?.providerSessionAnchor
+        ? { providerSessionAnchor: requestCorrelation(input.requestId)!.providerSessionAnchor } : {}),
       requestId: input.requestId ?? null,
       conversationId: target.conversationId,
       attributionMethod:
@@ -1685,6 +1714,18 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
         logInfo(`request attribution: provisional admission rejected for call ${call.callId}, request ${input.requestId ?? 'none'}; recording context no longer current, retrying as unattributed`);
         return fileToolCall(input, { conversationId: null, sessionId: null, turnId: null, attribution: 'unattributed' });
       }
+    } else if (call.providerSessionAnchor) {
+      const admitted = await recordProcessCall(sessionId, event, () => {
+        const proof = requestCorrelation(input.requestId);
+        return proof?.sessionId === sessionId && proof.conversationId === target.conversationId &&
+          proof.providerSessionAnchor === call.providerSessionAnchor;
+      });
+      if (!admitted) {
+        const proof = requestCorrelation(input.requestId);
+        logInfo(`request attribution: provider-session proof changed before recording call ${call.callId}; rereading its owner`);
+        return fileToolCall(input, { conversationId: proof?.conversationId ?? null,
+          sessionId: proof?.sessionId ?? null, attribution: proof ? 'request_id' : 'unattributed', turnId: null });
+      }
     } else await (call.process ? recordProcessCall : appendEvent)(sessionId, event);
     if (call.process && evidence.processCompletion) {
       // Bind once to the recorded call, never look up a reusable numeric process id.
@@ -1712,7 +1753,10 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       });
     }
     if (target.attribution === 'generation') {
-      logInfo(`request attribution: ${input.requestId} provisionally recorded in ${target.conversationId}; only observed running turn, not caller identity`);
+      // Provisional placement still lacks exact proof. Preserve stream diagnostics and
+      // register the unresolved id so a trace arriving later is reported too.
+      const trace = input.requestId ? requestTraceNote(input.requestId) : '';
+      logInfo(`request attribution: ${input.requestId} provisionally recorded in ${target.conversationId}; only observed running turn, not caller identity${trace || '; no matching stream trace observed'}`);
       notifyChanged(sessionId);
       if (input.requestId && requestCorrelation(input.requestId)) scheduleAttributionRepair(input.requestId);
       // Presentation cannot reopen a turn, bind an agent, transfer a terminal or grant
@@ -1821,8 +1865,14 @@ async function reopenFalselyEndedTurn(
   }
   if (live.turnStartedAt !== null) {
     if (callTurnId === live.turnId) live.turnRequestIds.add(requestId);
+    if (live.reopenedStop && live.reopenedStop.turnId === live.turnId && live.turnRequestIds.has(requestId)) {
+      live.reopenedStop.lastCallAt = Math.max(live.reopenedStop.lastCallAt, Date.now());
+    }
     return null;
   }
+  // Read before the reopen below clears it: only a turn the page ended as stopped or completed is closed again when quiet.
+  const closable = (outcome: unknown): 'stopped' | 'completed' | null => outcome === 'stopped' || outcome === 'completed' ? outcome : null;
+  let endOutcome = closable(live.endedTurn?.outcome);
   const previousEnd = live.endedTurn;
   let ended = previousEnd;
   const current = (): boolean => conversations.get(conversationId) === live &&
@@ -1839,6 +1889,7 @@ async function reopenFalselyEndedTurn(
         responseTurnId(summary.timelineTurns, owner.turnId) !== responseTurnId(summary.timelineTurns, boundary.turnId)) return null;
     ended = { turnId: boundary.turnId, startedAt: live.lastTurnStartedAt,
       endedAt: boundary.time, requestIds: new Set([requestId]) };
+    endOutcome = closable(boundary.outcome);
   }
   if (!ended || !ended.requestIds.has(requestId) || startedAt <= ended.endedAt) return null;
   // A request id proves conversation ownership, not that the selected native
@@ -1864,7 +1915,98 @@ async function reopenFalselyEndedTurn(
   logInfo(
     `session ${sessionId} reopened turn ${ended.turnId} — request ${requestId} kept calling tools after the page reported it ended`
   );
+  // A mark from an earlier reopening belongs to that one; this reopening decides afresh (CodeRabbit on #2087).
+  if (live.reopenedStop?.timer) clearTimeout(live.reopenedStop.timer);
+  live.reopenedStop = null;
+  if (endOutcome) {
+    // The reopen is already committed: a failed read only loses the longer Pro window, never the timer.
+    let pro = false;
+    try {
+      const model = (await getSession(sessionId))?.selectedModel;
+      pro = model?.conversationId === conversationId && isProModel(model.model, model.reasoningEffort);
+    } catch { /* the normal window */ }
+    armReopenedStop(sessionId, conversationId, live, ended.turnId, pro, endOutcome);
+  }
   return ended.turnId;
+}
+
+/**
+ * #2082: how long a stopped-then-reopened turn's request may stay silent before the app ends it
+ * again. Past the bridge's silence recovery (2 min) and chat activity window (3 min), so a reload of
+ * the page still comes first; Pro past its 10-minute silence window, as Pro can think quietly.
+ */
+export const REOPENED_STOP_QUIET_MS = CHAT_ACTIVE_MS + 60_000;
+export const REOPENED_STOP_PRO_QUIET_MS = 11 * 60_000;
+/**
+ * #2103: a turn the page ended as completed and that the same request then reopened. Nobody asked for
+ * this end, so the app waits as long as for Pro (past every silence recovery) before it ends the turn again.
+ */
+export const REOPENED_COMPLETED_QUIET_MS = 11 * 60_000;
+
+function reopenedStopQuietMs(live: LiveConversation): number {
+  if (live.reopenedStop?.outcome === 'completed') return REOPENED_COMPLETED_QUIET_MS;
+  return live.reopenedStop?.pro ? REOPENED_STOP_PRO_QUIET_MS : REOPENED_STOP_QUIET_MS;
+}
+
+function armReopenedStop(sessionId: string, conversationId: string, live: LiveConversation, turnId: string, pro: boolean, outcome: 'stopped' | 'completed'): void {
+  if (live.reopenedStop?.timer) clearTimeout(live.reopenedStop.timer);
+  live.reopenedStop = { turnId, lastCallAt: Date.now(), timer: null, pro, outcome };
+  scheduleReopenedStop(sessionId, conversationId, live, turnId, reopenedStopQuietMs(live));
+}
+
+function scheduleReopenedStop(sessionId: string, conversationId: string, live: LiveConversation, turnId: string, delay: number): void {
+  if (live.reopenedStop?.turnId !== turnId) return;
+  const timer = setTimeout(() => {
+    void endQuietReopenedStop(sessionId, conversationId, live, turnId).catch(error =>
+      logWarn(`session ${sessionId}: the reopened turn ${turnId} could not be ended again: ${error instanceof Error ? error.message : String(error)}`));
+  }, delay);
+  timer.unref?.();
+  live.reopenedStop.timer = timer;
+}
+
+/**
+ * The person stopped this turn, a call ChatGPT had already lined up reopened it, and the request has
+ * now made no call for the quiet window with none running. The page that should end it again may be hidden
+ * or reloaded (#2082), so the app ends it as stopped itself; a later call reopens it as before.
+ */
+async function endQuietReopenedStop(sessionId: string, conversationId: string, live: LiveConversation, turnId: string): Promise<void> {
+  const mark = live.reopenedStop;
+  if (!mark || mark.turnId !== turnId) return;
+  if (conversations.get(conversationId) !== live || live.turnId !== turnId || live.turnStartedAt === null) {
+    live.reopenedStop = null;
+    return;
+  }
+  const quiet = reopenedStopQuietMs(live), quietFor = Date.now() - mark.lastCallAt;
+  if (quietFor < quiet || runningToolCalls(conversationId) > 0) {
+    scheduleReopenedStop(sessionId, conversationId, live, turnId, Math.max(1_000, quiet - quietFor));
+    return;
+  }
+  // The mark stays until the end is written: a failed write tries again rather than leaving the turn
+  // open for good (CodeRabbit on #2087).
+  const time = Date.now();
+  try {
+    await appendEvent(sessionId, {
+      time, source: 'app', kind: 'turn_end', turnId, outcome: mark.outcome,
+      detail: mark.outcome === 'stopped'
+        ? 'the person stopped this turn; after a late call reopened it, ChatGPT made no further call'
+        : 'the page reported this turn completed; after a late call reopened it, ChatGPT made no further call'
+    });
+  } catch (error) {
+    logWarn(`session ${sessionId}: the reopened turn ${turnId} could not be ended again (${error instanceof Error ? error.message : String(error)}); trying again in 30 s`);
+    if (live.reopenedStop === mark) scheduleReopenedStop(sessionId, conversationId, live, turnId, 30_000);
+    return;
+  }
+  if (live.reopenedStop === mark) live.reopenedStop = null;
+  if (conversations.get(conversationId) !== live || live.turnId !== turnId) return;
+  live.openTurns.delete(turnId);
+  live.knownTurnEnds.add(turnId);
+  live.lastTurnOutcome = mark.outcome;
+  live.lastTurnStartedAt = live.turnStartedAt;
+  live.endedTurn = { turnId, startedAt: live.turnStartedAt, endedAt: time, requestIds: live.turnRequestIds, outcome: mark.outcome };
+  live.turnRequestIds = new Set<string>();
+  live.turnStartedAt = null;
+  live.turnId = null;
+  logInfo(`session ${sessionId} ended turn ${turnId} again as ${mark.outcome} — after the page's end its request made no call for ${Math.round(quiet / 60_000)} min`);
 }
 
 interface Target {
@@ -2870,7 +3012,7 @@ async function recordChatObservationsNow(
           // final is checked separately before later work can reopen the turn.
           live.endedTurn =
             live.turnId === item.turnId
-              ? { turnId: item.turnId, startedAt: endedStartedAt, endedAt: item.time, requestIds: live.turnRequestIds }
+              ? { turnId: item.turnId, startedAt: endedStartedAt, endedAt: item.time, requestIds: live.turnRequestIds, outcome: item.outcome ?? 'unknown' }
               : null;
           live.turnRequestIds = new Set<string>();
           if (live.turnId === item.turnId) {
@@ -2922,7 +3064,7 @@ async function recordChatObservationsNow(
     live.lastTurnOutcome = 'completed';
     live.lastTurnStartedAt = live.turnStartedAt;
     // Native message time may be its creation time, long before this final was observed.
-    live.endedTurn = { turnId, startedAt: live.turnStartedAt, endedAt: Date.now(), requestIds: live.turnRequestIds };
+    live.endedTurn = { turnId, startedAt: live.turnStartedAt, endedAt: Date.now(), requestIds: live.turnRequestIds, outcome: 'completed' };
     live.turnRequestIds = new Set<string>();
     live.turnStartedAt = null;
     live.turnId = null;

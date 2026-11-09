@@ -22,7 +22,7 @@
  */
 
 import { modelFacingText } from '../../shared/content-reference.js';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { isProModel } from '../../shared/chat-models.js';
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -48,6 +48,7 @@ import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, 
 import { automaticTitle, firstTitleMessage, legacyContextTitle, legacyLabelPending, projectPageTitle, providerTitleIgnored, refreshUserTitle, userTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { turnTrace, type TurnTrace } from '../../shared/turn-trace.js';
+import { sameUserRequest, USER_REQUEST_LIMITS, userRequestSchema, userRequestsFileSchema, type UserRequest } from '../../shared/user-requests.js';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 
@@ -933,6 +934,7 @@ async function rebuildSummaryFromHistory(
         userMessages: rebuilt.userMessages,
         toolCalls: rebuilt.toolCalls,
         provisionalToolCalls: rebuilt.provisionalToolCalls ?? 0,
+        providerSessionToolCalls: rebuilt.providerSessionToolCalls ?? 0,
         lastToolCallAt: rebuilt.lastToolCallAt,
         lastToolActivity: rebuilt.lastToolActivity,
         lastAssistantFinalAt: rebuilt.lastAssistantFinalAt,
@@ -1142,6 +1144,7 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   if (event.kind === 'tool_call') {
     summary.toolCalls += 1;
     if (event.call.attributionMethod === 'generation') summary.provisionalToolCalls = (summary.provisionalToolCalls ?? 0) + 1;
+    if (event.call.providerSessionAnchor) summary.providerSessionToolCalls = (summary.providerSessionToolCalls ?? 0) + 1;
     const priorToolAt = summary.lastToolCallAt ?? 0;
     summary.lastToolCallAt = Math.max(priorToolAt, event.time);
     // Attribution repair can append an older call after newer activity. Keep the projection
@@ -1389,6 +1392,12 @@ export function appendEvent(sessionId: string, event: NewSessionEvent): Promise<
  * preserves the sequence/time position where that stable website message first appeared, so
  * revisions cannot move either a user response boundary or assistant prose through later work.
  */
+/** True when `next` is complete text that starts with all of `previous` and has more after it. */
+function continuesFinalText(previous: StoredText, next: StoredText): boolean {
+  return !previous.truncated && !next.truncated && previous.text.length > 0 &&
+    next.text.length > previous.text.length && next.text.startsWith(previous.text);
+}
+
 export function upsertMessageEvent(
   sessionId: string,
   event: NewMessageEvent,
@@ -1417,12 +1426,32 @@ export function upsertMessageEvent(
       // Final is terminal for one canonical ChatGPT message. The page can briefly re-report
       // an older streaming DOM snapshot after settling/remounting; accepting that snapshot
       // would turn a completed answer back into a partial one and could replace its text.
+      // A snapshot that carries the final text and then more is new writing, not a stale copy: after
+      // a Stop that ChatGPT had not obeyed, the page reported the first sentence as final and the
+      // same message kept growing (#2097). It stays final (the page called it final), so a delayed
+      // shorter snapshot is ignored by the rule below, and only longer text of the same message is taken.
+      const continuing =
+        previous?.kind === 'assistant_message' && event.kind === 'assistant_message' &&
+        (previous.final === true || previous.state === 'final') &&
+        event.final !== true && event.state !== 'final' &&
+        continuesFinalText(previous.message, event.message);
       if (
         previous?.kind === 'assistant_message' &&
         event.kind === 'assistant_message' &&
         (previous.final === true || previous.state === 'final') &&
         event.final !== true &&
-        event.state !== 'final'
+        event.state !== 'final' &&
+        !continuing
+      ) {
+        return { event: previous, changed: false, contentChanged: false };
+      }
+      // A delayed final that only repeats the start of a longer stored final is a stale replay, not a
+      // correction: it would cut an accepted continuation back (CodeRabbit on #2099). Different text still wins.
+      if (
+        previous?.kind === 'assistant_message' && event.kind === 'assistant_message' &&
+        (previous.final === true || previous.state === 'final') &&
+        (event.final === true || event.state === 'final') &&
+        continuesFinalText(event.message, previous.message)
       ) {
         return { event: previous, changed: false, contentChanged: false };
       }
@@ -1447,8 +1476,8 @@ export function upsertMessageEvent(
               resolvedModel: event.resolvedModel ?? previous.resolvedModel,
               references: event.references ?? previous.references,
               // `final` is a compatibility mirror of state, not an independent truth.
-              state: event.state === 'final' || event.final === true ? 'final' : 'streaming',
-              final: event.state === 'final' || event.final === true,
+              state: continuing || event.state === 'final' || event.final === true ? 'final' : 'streaming',
+              final: continuing || event.state === 'final' || event.final === true,
               // Goal eligibility is an accepted fact about this stable reply, not a property a
               // later sparse page snapshot may retract. This is what makes a 503/reload replay
               // re-offer the same durable obligation instead of silently dropping it.
@@ -1464,6 +1493,7 @@ export function upsertMessageEvent(
           : previous?.kind === 'user_message' && event.kind === 'user_message'
             ? { ...event, inputId: event.inputId ?? previous.inputId,
                 ...(event.scheduled ?? previous.scheduled ? { scheduled: event.scheduled ?? previous.scheduled } : {}),
+                ...(event.via ?? previous.via ? { via: event.via ?? previous.via } : {}),
                 authoredAt: previous.authoredAt ?? event.authoredAt,
                 authoredText: event.authoredText ?? previous.authoredText,
                 wireTokenEstimate: event.wireTokenEstimate ?? previous.wireTokenEstimate,
@@ -1584,6 +1614,19 @@ export function upsertMessageEvent(
         entry.summary.contextTokens = Math.max(0, entry.summary.contextTokens + delta);
         entry.summary.updatedAt = Math.max(entry.summary.updatedAt, nextEvent.time);
         noteFinishWork(entry.summary, full);
+        // The worker dock's answer line follows the newest final answer: when this message becomes final
+        // as the newest one, and when its final text grows while the dock still shows it.
+        if (full.kind === 'assistant_message' && (full.final === true || full.state === 'final')) {
+          const wasFinal = previous.kind === 'assistant_message' && (previous.final === true || previous.state === 'final');
+          // Same first line is not same owner: an older message with an identical line must not take over the
+          // dock's line from a newer final answer (CodeRabbit on #2099), so it also has to be the newest final.
+          const newestFinal = !([...entry.messages.values()].some(other => other !== full && other.kind === 'assistant_message' &&
+            (other.final === true || other.state === 'final') && other.time > full.time));
+          const showsThis = newestFinal && previous.kind === 'assistant_message' && entry.summary.lastAnswerLine === answerLine(previous.message.text);
+          if (wasFinal ? showsThis : nextEvent.time >= (entry.summary.lastAssistantFinalAt ?? 0)) {
+            entry.summary.lastAnswerLine = answerLine(full.message.text);
+          }
+        }
         // Only a new final is new work. The same finished answer re-reported after a reload or a
         // branch keeps its boundary, or the sidebar would call a read chat "New response".
         const finalBefore = sameMessage && previous.kind === 'assistant_message' &&
@@ -1752,7 +1795,7 @@ export async function reviseProvisionalCall(sessionId: string, callId: string,
   await enqueueSessionOperation(entry, 'provisional attribution', async () => {
     const key = `tool_call\u0000${callId}`;
     const previous = entry.messages.get(key);
-    if (previous?.kind !== 'tool_call' || previous.call.attributionMethod !== 'generation') return;
+    if (previous?.kind !== 'tool_call' || previous.call.attributionMethod !== 'generation' && !previous.call.providerSessionAnchor) return;
     // Invalidate the checkpoint before changing shards, including when the deleted shard
     // was not the newest. A crash at any following boundary must rebuild the counters.
     await writeSummary(entry.summary, -1);
@@ -3467,6 +3510,130 @@ export async function updateSessionPlan(
 }
 
 /**
+ * Steps handed to the person (#1695): one small `requests.json` per session, like the plan. Keyed
+ * by session, not by ChatGPT chat, so a chat continued by Compact & Resume can still check them.
+ */
+// A full file of the largest allowed steps, with JSON escaping, stays well under this (about 21 MB).
+const MAX_USER_REQUESTS_BYTES = 32 * 1024 * 1024;
+
+/**
+ * `quarantine` only inside the session queue: a reader outside it could otherwise move aside a
+ * valid file a queued write had just put in place, losing a step the tool already reported.
+ * Outside the queue a damaged file reads as no steps and stays where it is.
+ */
+/** Sessions whose damaged steps file was already reported; the screen reads it every few hundred ms. */
+const unreadableUserRequests = new Set<string>();
+
+async function readUserRequestsFile(id: string, quarantine = false): Promise<UserRequest[]> {
+  const target = path.join(sessionDir(id), 'requests.json');
+  let text: string;
+  try {
+    const stat = await fs.stat(target);
+    if (stat.size > MAX_USER_REQUESTS_BYTES) throw new SyntaxError('too large');
+    text = await fs.readFile(target, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') { unreadableUserRequests.delete(id); return []; }
+    if (!(error instanceof SyntaxError)) throw error;
+    text = '';
+  }
+  try {
+    const parsed = userRequestsFileSchema.safeParse(JSON.parse(text));
+    if (parsed.success) { unreadableUserRequests.delete(id); return parsed.data.requests; }
+  } catch { /* unreadable: kept aside below */ }
+  if (!quarantine) {
+    // Once per damaged file, not on every read (CodeRabbit on #2049).
+    if (!unreadableUserRequests.has(id)) {
+      if (unreadableUserRequests.size >= 256) unreadableUserRequests.delete(unreadableUserRequests.values().next().value!);
+      unreadableUserRequests.add(id);
+      logWarn(`session ${id}: steps for the person are unreadable; showing none until the next change keeps the file aside`);
+    }
+    return [];
+  }
+  // Kept aside rather than overwritten, so a damaged file can still be looked at. If it cannot be
+  // moved, nothing new is written over it.
+  const aside = `${target}.unreadable-${Date.now()}`;
+  try {
+    await fs.rename(target, aside);
+  } catch (error) {
+    logWarn(`session ${id}: steps for the person are unreadable and could not be kept aside (${(error as NodeJS.ErrnoException).code ?? 'error'}); not writing over them`);
+    throw new Error('The saved steps for the person are damaged and could not be kept aside, so no new step was written.');
+  }
+  unreadableUserRequests.delete(id);
+  logWarn(`session ${id}: steps for the person were unreadable; kept as ${path.basename(aside)} and started empty`);
+  return [];
+}
+
+async function writeUserRequestsFile(id: string, requests: UserRequest[]): Promise<void> {
+  const target = path.join(sessionDir(id), 'requests.json');
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify({ version: 1, requests }), 'utf8');
+    await fs.rename(temporary, target);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+function newUserRequestId(): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  // randomInt draws without the bias a byte modulo 36 would have (CodeQL on #2049).
+  return `ur_${Array.from({ length: 12 }, () => alphabet[randomInt(alphabet.length)]).join('')}`;
+}
+
+export type FileUserRequestResult =
+  | { request: UserRequest; existing: boolean }
+  | { refused: 'open-limit' };
+
+/** Records a step for the person; the same open step asked again returns the first one. */
+export async function fileUserRequest(
+  id: string,
+  input: Omit<UserRequest, 'id' | 'state' | 'createdAt' | 'answeredAt'>,
+  now = Date.now()
+): Promise<FileUserRequestResult> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'user-request', async () => {
+    const requests = await readUserRequestsFile(id, true);
+    const existing = requests.find(request => request.state === 'open' && sameUserRequest(request, input));
+    if (existing) return { request: existing, existing: true };
+    if (requests.filter(request => request.state === 'open').length >= USER_REQUEST_LIMITS.open) return { refused: 'open-limit' };
+    const request = userRequestSchema.parse({ ...input, id: newUserRequestId(), state: 'open', createdAt: now });
+    const kept = [...requests, request];
+    // Answered steps make room, oldest first; open ones are never dropped (20 open < 60 kept).
+    while (kept.length > USER_REQUEST_LIMITS.kept) {
+      const oldest = kept.findIndex(row => row.state !== 'open');
+      if (oldest < 0) break;
+      kept.splice(oldest, 1);
+    }
+    await writeUserRequestsFile(id, kept);
+    return { request, existing: false };
+  });
+}
+
+/** The person's answer. Null when the step is unknown; an answered step keeps its first answer. */
+export async function answerUserRequest(
+  id: string, requestId: string, answer: 'done' | 'skipped', now = Date.now()
+): Promise<{ request: UserRequest; changed: boolean } | null> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'user-request', async () => {
+    const requests = await readUserRequestsFile(id, true);
+    const index = requests.findIndex(request => request.id === requestId);
+    const current = requests[index];
+    if (!current) return null;
+    if (current.state !== 'open') return { request: current, changed: false };
+    const request: UserRequest = { ...current, state: answer, answeredAt: now };
+    requests[index] = request;
+    await writeUserRequestsFile(id, requests);
+    return { request, changed: true };
+  });
+}
+
+export async function readSessionUserRequests(id: string): Promise<UserRequest[]> {
+  assertSessionId(id);
+  await open.get(id)?.queue;
+  return readUserRequestsFile(id);
+}
+
+/**
  * Round outlines (shared/turn-trace.ts): one small file per local turn under `traces/`, beside
  * the log rather than in it, since an outline is presentation and never evidence. Each write
  * replaces the turn's whole outline; the newest reads are kept in memory.
@@ -3691,6 +3858,23 @@ export async function moveSessionProject(id: string, projectId: string | null): 
   });
 }
 
+/**
+ * The person changed this chat's project's related folders (#1689): their next message tells ChatGPT
+ * the project folder and the related folders again, once, as after a move. Old messages stay as they are.
+ */
+export async function markProjectNote(id: string, projectId: string): Promise<boolean> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'project note', async () => {
+    const subAgent = entry.summary.origin?.kind === 'worker' || entry.summary.origin?.kind === 'helper';
+    if (entry.summary.projectId !== projectId || subAgent || entry.summary.projectNotePending) return false;
+    const staged: SessionSummary = { ...entry.summary, projectNotePending: true };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return true;
+  });
+}
+
 /** The person's message that told ChatGPT a moved chat's folder was delivered. */
 export async function clearProjectNote(id: string): Promise<void> {
   const entry = await ensureOpen(id);
@@ -3830,6 +4014,12 @@ export async function rebindSession(
       browserRecoveryDismissedAt: undefined,
       ...(committedResumeHandoffId !== undefined
         ? { lastCommittedResumeHandoffId: committedResumeHandoffId }
+        : {}),
+      // After Compact & Resume the person's next message tells the new chat its project folder and
+      // the project's related folders as they are then (#1689), not as the old chat's brief knew them.
+      ...(committedResumeHandoffId !== undefined && entry.summary.projectId &&
+        entry.summary.origin?.kind !== 'worker' && entry.summary.origin?.kind !== 'helper'
+        ? { projectNotePending: true as const }
         : {}),
       updatedAt: Date.now(),
       // A session whose chat was closed during the handover is live again the moment its new

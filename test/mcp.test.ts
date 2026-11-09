@@ -37,7 +37,9 @@ import {
   initSessionStore,
   readRecentEvents,
   rebindSession,
-  readSessionPlan
+  readSessionPlan,
+  readSessionUserRequests,
+  answerUserRequest
 } from '../src/main/session/store.js';
 import {
   bindConversation,
@@ -49,8 +51,8 @@ import {
 import { resetWorkspaces, setWorkspaceFor } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import { foldProgress, type ToolOutcome } from '../src/shared/session.js';
-import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { emptyEvidence, inFlightMcpRequests, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
+import { observeRequestCorrelation, requestCorrelation } from '../src/main/session/correlation.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS } from '../src/shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS } from '../src/shared/browser-control.js';
 import { resetBlockedChatsForTests, setChatBlocked } from '../src/main/session/blocked-chats.js';
@@ -641,6 +643,255 @@ describe('endpoint hardening', () => {
 // ---------------------------------------------------------------------------
 
 describe('surface boundaries', () => {
+  it('dispatches a known native request while another chat waits for its provider commit', async () => {
+    const durable = await import('../src/main/durable.js');
+    durable.initDurableStore(path.join(base, 'fast-native-admission'));
+    const send = (requestId: string, provider: string) => rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+          'openai/session': provider, 'openai/subject': 'provider-user'
+        }
+      }
+    }), { 'x-request-id': requestId });
+    for (const suffix of ['a', 'b']) {
+      const session = await createSession({ conversationId: `fast-http-${suffix}` });
+      observeRequestCorrelation({ requestId: `fast-http-native-${suffix}`, conversationId: `fast-http-${suffix}`, sessionId: session.id,
+        messageId: `fast-http-message-${suffix}`, tool: '', observedAt: Date.now() });
+      expect((await send(`fast-http-native-${suffix}`, `fast-http-provider-${suffix}`)).status).toBe(200);
+    }
+    const write = durable.writeDurableNow;
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const commit = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async (name, value) => {
+      entered(); await resume; return write(name, value);
+    });
+    const slow = send('fast-http-derived-a', 'fast-http-provider-a');
+    let fast: Promise<RawResponse> | undefined;
+    try {
+      await paused;
+      let response: RawResponse | undefined;
+      fast = send('fast-http-native-b', 'fast-http-provider-b').then(value => { response = value; return value; });
+      await vi.waitFor(() => expect(response).toBeDefined(), { timeout: 10_000 });
+      expect(response!.status).toBe(200);
+      const reply = { body: decode(response!) };
+      expect(failed(reply)).toBe(false);
+      expect(textOf(reply)).toContain('note line 1');
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect(requestCorrelation('fast-http-derived-a')).toBeNull();
+      expect(requestCorrelation('fast-http-native-b')?.conversationId).toBe('fast-http-b');
+    } finally {
+      release();
+      await Promise.all([slow, fast]);
+      commit.mockRestore();
+      await durable.flushDurable();
+      durable.resetDurableForTests();
+    }
+    expect(requestCorrelation('fast-http-derived-a')?.providerSessionAnchor).toBe('fast-http-native-a');
+  });
+
+  it.each(['unbound', 'native', 'late-native'] as const)(
+    'dispatches a %s request when the provider-session commit fails without publishing derived ownership', async identity => {
+      const durable = await import('../src/main/durable.js');
+      const logger = await import('../src/main/logger.js');
+      const prefix = `provider-commit-failure-${identity}`;
+      const requestId = `${prefix}-request`;
+      const source = await createSession({ conversationId: `${prefix}-source` });
+      const native = identity === 'late-native'
+        ? await createSession({ conversationId: `${prefix}-native` }) : source;
+      durable.initDurableStore(path.join(base, prefix));
+      const prove = (id: string, session = source) => observeRequestCorrelation({
+        requestId: id, conversationId: session.conversationId!, sessionId: session.id,
+        messageId: `message-${id}`, tool: '', observedAt: Date.now()
+      });
+      const send = (id: string) => rawPost(endpoint.urls.core, JSON.stringify({
+        jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+          name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+            'openai/session': prefix, 'openai/subject': 'provider-user'
+          }
+        }
+      }), { 'x-request-id': id });
+      let commit: ReturnType<typeof vi.spyOn> | undefined;
+      const warning = vi.spyOn(logger, 'logWarn');
+      try {
+        prove(`${prefix}-anchor`);
+        expect((await send(`${prefix}-anchor`)).status).toBe(200);
+        if (identity === 'native') prove(requestId);
+        commit = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async () => {
+          if (identity === 'late-native') prove(requestId, native);
+          throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+        });
+        const response = await send(requestId);
+        expect(commit).toHaveBeenCalledWith('request-correlations', expect.anything());
+        expect(response.status).toBe(200);
+        const reply = { body: decode(response) };
+        expect(failed(reply)).toBe(false);
+        expect(textOf(reply)).toContain('note line 1');
+        expect(warning).toHaveBeenCalledWith(
+          `MCP provider session binding ignored surface=core request=${requestId}; durable correlation unavailable; dispatch uses existing request identity`);
+        if (identity === 'unbound') expect(requestCorrelation(requestId)).toBeNull();
+        else expect(requestCorrelation(requestId)).toMatchObject({
+          conversationId: native.conversationId, sessionId: native.id
+        });
+        expect(requestCorrelation(requestId)?.providerSessionAnchor).toBeUndefined();
+        await durable.flushDurable();
+        const saved = await durable.readDurable<{ entries: Array<{ requestId: string; providerSessionAnchor?: string }> }>('request-correlations');
+        expect(saved?.entries.some(row => row.requestId === requestId && row.providerSessionAnchor)).toBe(false);
+      } finally {
+        commit?.mockRestore();
+        warning.mockRestore();
+        await durable.flushDurable();
+        durable.resetDurableForTests();
+      }
+    }
+  );
+
+  it('dispatches calls with a conflicting provider key without deriving ownership, including after restart', async () => {
+    const correlation = await import('../src/main/session/correlation.js');
+    const durable = await import('../src/main/durable.js');
+    const { getLog } = await import('../src/main/logger.js');
+    durable.initDurableStore(path.join(base, 'conflicting-provider'));
+    const chats = ['conflicting-provider-a', 'conflicting-provider-b'];
+    const anchors = ['conflicting-native-a', 'conflicting-native-b'];
+    const sessions = await Promise.all(chats.map(conversationId => createSession({ conversationId })));
+    const send = (requestId: string) => rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+          'openai/session': 'shared-conflicting-provider', 'openai/subject': 'provider-user'
+        }
+      }
+    }), { 'x-request-id': requestId });
+    const expectRead = async (requestId: string) => {
+      const response = await send(requestId);
+      expect(response.status).toBe(200);
+      const reply = { body: decode(response) };
+      expect(failed(reply)).toBe(false);
+      expect(textOf(reply)).toContain('note line 1');
+    };
+    try {
+      for (const [index, requestId] of anchors.entries()) {
+        observeRequestCorrelation({ requestId, conversationId: chats[index]!, sessionId: sessions[index]!.id,
+          messageId: `message-${requestId}`, tool: '', observedAt: Date.now() });
+      }
+      await expectRead(anchors[0]!);
+      await expectRead('conflicting-derived-before');
+      expect(requestCorrelation('conflicting-derived-before')?.providerSessionAnchor).toBe(anchors[0]);
+      const before = getLog().length;
+      await expectRead(anchors[1]!);
+      for (const requestId of ['conflicting-derived-before', 'conflicting-unknown', 'conflicting-unknown-again']) {
+        await expectRead(requestId);
+        expect(requestCorrelation(requestId)).toBeNull();
+      }
+      const warnings = getLog().slice(before).filter(row => /provider session.*conflict/i.test(row.message));
+      expect(warnings).toHaveLength(1);
+
+      await durable.flushDurable();
+      correlation.resetCorrelationRegistryForTests();
+      await correlation.restoreRequestCorrelations();
+      await expectRead('conflicting-after-restart');
+      expect(requestCorrelation('conflicting-after-restart')).toBeNull();
+      for (const [index, requestId] of anchors.entries()) {
+        await expectRead(requestId);
+        expect(requestCorrelation(requestId)).toMatchObject({ conversationId: chats[index], sessionId: sessions[index]!.id });
+        expect(requestCorrelation(requestId)?.providerSessionAnchor).toBeUndefined();
+      }
+      // Ignoring provider metadata must not bypass the native owner's ordinary guards.
+      setChatBlocked(chats[1]!, true);
+      try {
+        const blocked = { body: decode(await send(anchors[1]!)) };
+        expect(failed(blocked)).toBe(true);
+        expect(textOf(blocked)).toMatch(/blocked/i);
+        expect(textOf(blocked)).not.toContain('note line 1');
+      } finally { setChatBlocked(chats[1]!, false); }
+    } finally {
+      await durable.flushDurable();
+      durable.resetDurableForTests();
+    }
+  });
+
+  it('dispatches with native ownership when it contradicts the provider anchor during admission', async () => {
+    const durable = await import('../src/main/durable.js');
+    const source = await createSession({ conversationId: 'provider-race-a' });
+    const native = await createSession({ conversationId: 'provider-race-b' });
+    const send = (requestId: string) => rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+          'openai/session': 'provider-race', 'openai/subject': 'provider-user'
+        }
+      }
+    }), { 'x-request-id': requestId });
+    observeRequestCorrelation({ requestId: 'provider-race-anchor', conversationId: 'provider-race-a', sessionId: source.id,
+      messageId: 'provider-race-message-a', tool: '', observedAt: Date.now() });
+    await send('provider-race-anchor');
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const write = durable.writeDurableNow;
+    const commit = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async (name, value) => {
+      entered(); await resume; return write(name, value);
+    });
+    const pending = send('provider-race-request');
+    try {
+      await paused;
+      expect(requestCorrelation('provider-race-request')).toBeNull();
+      observeRequestCorrelation({ requestId: 'provider-race-request', conversationId: 'provider-race-b', sessionId: native.id,
+        messageId: 'provider-race-message-b', tool: '', observedAt: Date.now() });
+      release();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      const reply = { body: decode(response) };
+      expect(failed(reply)).toBe(false);
+      expect(textOf(reply)).toContain('note line 1');
+      expect(requestCorrelation('provider-race-request')).toMatchObject({ conversationId: 'provider-race-b', sessionId: native.id });
+      expect(requestCorrelation('provider-race-request')?.providerSessionAnchor).toBeUndefined();
+      expect((await readRecentEvents(native.id, 20)).some(event => event.kind === 'tool_call' &&
+        event.call.requestId === 'provider-race-request')).toBe(true);
+      expect((await readRecentEvents(source.id, 20)).some(event => event.kind === 'tool_call' &&
+        event.call.requestId === 'provider-race-request')).toBe(false);
+    } finally {
+      release();
+      await pending;
+      commit.mockRestore();
+    }
+  });
+
+  it('drains an accepted request while its provider-session admission is waiting on storage', async () => {
+    const correlation = await import('../src/main/session/correlation.js');
+    const { getLog } = await import('../src/main/logger.js');
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(correlation, 'observeProviderSessionRequest').mockImplementationOnce(async () => {
+      entered(); await resume; return 'unbound';
+    });
+    const request = rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call',
+      params: { name: 'missing_diagnostic_tool', arguments: {}, _meta: {
+        'openai/session': 'drain-provider', 'openai/subject': 'drain-subject'
+      } } }), { 'x-request-id': 'drain-provider-request' }).catch(() => ({ status: 0, headers: {}, text: '' }));
+    await paused;
+    const before = getLog().length;
+    const stopped = endpoint.stop();
+    try {
+      expect(getLog().slice(before).some(row => row.message === 'server stopping: draining 1 accepted response(s)')).toBe(true);
+    } finally { release(); await stopped; }
+    expect((await request).status).toBe(200);
+  });
+
+  it.each(['core', 'desktop', 'plugins'] as const)('resolves a hidden %s request through its independently proven provider session', async surface => {
+    const source = await createSession({ conversationId: `provider-${surface}` });
+    const anchor = `native-provider-${surface}`, hidden = `hidden-provider-${surface}`;
+    observeRequestCorrelation({ requestId: anchor, conversationId: `provider-${surface}`, sessionId: source.id,
+      messageId: `native-message-${surface}`, tool: '', observedAt: Date.now() });
+    const send = (requestId: string) => rawPost(endpoint.urls[surface], JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call',
+      params: { name: 'missing_diagnostic_tool', arguments: {}, _meta: {
+        'openai/session': `provider-token-${surface}`, 'openai/subject': 'provider-user'
+      } } }), { 'x-request-id': requestId });
+    await send(anchor);
+    await send(hidden);
+    expect(requestCorrelation(hidden)).toMatchObject({ conversationId: `provider-${surface}`, sessionId: source.id,
+      providerSessionAnchor: anchor });
+  });
+
   /** Turns everything on, so each surface advertises the most it ever can. */
   const everything = (): void => {
     ctx.caps = allCaps();
@@ -653,7 +904,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec', 'exec_command', 'read', 'save_image', 'update_plan', 'usage', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'ask_user_to_run', 'exec', 'exec_command', 'read', 'save_image', 'update_plan', 'usage', 'user_request_status', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter(name => name !== 'exec')) expect(names, name).not.toContain(name);
   });
 
@@ -963,6 +1214,13 @@ describe('surface boundaries', () => {
     const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'write_stdin');
     expect(tool?.description).toBeTruthy();
     expect(tool!.description).not.toMatch(/automatic(ally)? deliver|never reruns|delivered automatically/i);
+    // Flagged again on 2026-11-06 (VM): "Empty chars read the session output … Completed processes
+    // reject input" read as "a policy-like instruction to treat empty input as a read operation".
+    // Neither the tool nor its input may say how empty input or a finished process is to be treated.
+    const chars = (tool as any).inputSchema?.properties?.chars?.description as string | undefined;
+    for (const text of [tool!.description, chars ?? '']) {
+      expect(text).not.toMatch(/empty (chars|input)[^.]*\bread|\breject|read operation|treated/i);
+    }
   });
 
   it('saves a generated image only for a call it can tie to its chat (#889)', async () => {
@@ -980,6 +1238,8 @@ describe('surface boundaries', () => {
     // It names the Core that answered, so a call sent to another computer's Core says so (#1097).
     expect(refusal).toContain('Chat On Steroids Core could not tell');
     expect(refusal).toContain('If the chat belongs to another computer');
+    expect(refusal).toContain('calling it from an exec step is fine');
+    expect(refusal).not.toMatch(/not from inside a/);
   });
 
   it('keeps the worst-case no-query discovery of each surface small', async () => {
@@ -988,7 +1248,7 @@ describe('surface boundaries', () => {
     const desktopTools = toolList(await desktop('tools/list'));
 
     // Each populated surface includes code mode; find and the shell exec pair remain exclusive.
-    expect(coreTools).toHaveLength(10);
+    expect(coreTools).toHaveLength(12);
     expect(desktopTools).toHaveLength(BROWSER_TOOLS.length + (IS_WINDOWS ? 16 : process.platform === 'darwin' ? 3 : 1));
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -3474,6 +3734,42 @@ describe('exec_command and write_stdin', () => {
 });
 
 describe('agent-maintained plans over MCP', () => {
+  it('preserves Block enforcement after provider-session identity is recovered', async () => {
+    ctx.sessionTools = true;
+    const source = await createSession({ conversationId: 'blocked-provider-plan' });
+    const anchor = 'blocked-provider-anchor';
+    observeRequestCorrelation({ requestId: anchor, conversationId: 'blocked-provider-plan', sessionId: source.id,
+      messageId: 'blocked-provider-message', tool: '', observedAt: Date.now() });
+    const send = (requestId: string) => rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+      name: 'update_plan', arguments: { plan: [] }, _meta: { 'openai/session': 'blocked-provider-token', 'openai/subject': 'provider-user' }
+    } }), { 'x-request-id': requestId });
+    await send(anchor);
+    await setChatBlocked('blocked-provider-plan', true);
+    try {
+      const refused = decode(await send('blocked-provider-hidden'));
+      expect(refused.result.isError).toBe(true);
+      expect(requestCorrelation('blocked-provider-hidden')?.conversationId).toBe('blocked-provider-plan');
+      expect(refused.result.content.map((part: { text?: string }) => part.text ?? '').join('\n')).toMatch(/blocked/i);
+    } finally { await setChatBlocked('blocked-provider-plan', false); }
+  });
+
+  it('completes the visible plan when a later request carries the same proven provider conversation', async () => {
+    ctx.sessionTools = true;
+    const source = await createSession({ conversationId: 'provider-plan-http' });
+    observeRequestCorrelation({ requestId: 'provider-plan-anchor', conversationId: 'provider-plan-http',
+      sessionId: source.id, messageId: 'provider-plan-message', tool: '', observedAt: Date.now() });
+    const send = (requestId: string, status: 'in_progress' | 'completed') => rawPost(endpoint.urls.core,
+      JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'update_plan', arguments: { plan: [{ step: 'Check provider identity', status }] },
+        _meta: { 'openai/session': 'opaque-provider-conversation', 'openai/subject': 'opaque-provider-user' }
+      } }), { 'x-request-id': requestId });
+    expect(decode(await send('provider-plan-anchor', 'in_progress')).result.isError).not.toBe(true);
+    const completed = decode(await send('provider-plan-hidden', 'completed'));
+    expect(completed.result.isError).not.toBe(true);
+    expect((await readSessionPlan(source.id))?.plan[0]?.status).toBe('completed');
+    expect(completed.result.content.map((part: { text?: string }) => part.text ?? '').join('\n')).not.toContain('Exact caller identity is not available');
+  });
+
   it('uses exact request proof without workers, refuses foreign targets and retired chats', async () => {
     ctx.sessionTools = true;
     ctx.agentTools = false;
@@ -3514,6 +3810,149 @@ describe('agent-maintained plans over MCP', () => {
     const disabled = await core('tools/call', { name: 'update_plan', arguments: { plan: [] } });
     expect(failed(disabled)).toBe(true);
     expect(textOf(disabled)).toContain('Session recording');
+  });
+});
+
+describe('steps handed to the person over MCP (#1695)', () => {
+  const setup = (): void => {
+    ctx.readOnly = false;
+    ctx.caps = withCaps({ command: true });
+    ctx.sessionTools = true;
+    ctx.agentTools = false;
+  };
+  const sendAs = (requestId: string | null, name: string, arguments_: Record<string, unknown>) => modern('tools/call',
+    { name, arguments: arguments_ }, requestId ? { 'x-request-id': `${requestId}/att1` } : {});
+  const proveFor = (sessionId: string, conversationId: string) => (requestId: string, tool = 'ask_user_to_run') =>
+    observeRequestCorrelation({ requestId, conversationId, sessionId, messageId: `msg-${requestId}`, tool, observedAt: Date.now() });
+  const step = { command: 'make release', purpose: 'Sign in to the license server first', expected: ['out/report.txt', '../private/passwords.txt'] };
+
+  // Live on the Windows VM (2026-11-07): ChatGPT handed a step in the first answer of a new chat, two
+  // seconds before the page proved which chat the call came from. The tool refused at once ("Exact chat
+  // identity is required") instead of waiting for that proof, as exec and update_plan do.
+  it('waits for the page to prove the chat of a step handed before that proof arrives', async () => {
+    setup();
+    const session = await createSession({ conversationId: 'step-late-proof' });
+    const prove = proveFor(session.id, 'step-late-proof');
+    const pending = sendAs('wfr_step_late', 'ask_user_to_run', step);
+    // The proof comes only once the call is inside the app and waiting, never by elapsed time
+    // (CodeRabbit on #2088): before the fix the call was refused at once and never waited here.
+    await vi.waitFor(() => expect(inFlightMcpRequests()).toBeGreaterThan(0), { timeout: 10_000 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(inFlightMcpRequests()).toBeGreaterThan(0);
+    expect(prove('wfr_step_late')).toBe('stored');
+    const result = await pending;
+    expect(failed(result)).toBe(false);
+    expect(await readSessionUserRequests(session.id)).toHaveLength(1);
+  });
+
+  it('records a step only for an identified chat, returns the same open step when asked again, and runs nothing', async () => {
+    setup();
+    const session = await createSession({ conversationId: 'step-http-source' });
+    const prove = proveFor(session.id, 'step-http-source');
+    expect(failed(await sendAs(null, 'ask_user_to_run', step))).toBe(true);
+    expect(await readSessionUserRequests(session.id)).toEqual([]);
+
+    expect(prove('wfr_step_one')).toBe('stored');
+    const first = await sendAs('wfr_step_one', 'ask_user_to_run', { ...step, constraints: 'Run once' });
+    expect(failed(first)).toBe(false);
+    const id = /ur_[a-z0-9]{12}/.exec(textOf(first))?.[0];
+    expect(id).toBeTruthy();
+    expect(textOf(first)).toContain('does not run it');
+    const [saved] = await readSessionUserRequests(session.id);
+    expect(saved).toMatchObject({ id, command: 'make release', folder: approved, remote: false, state: 'open', constraints: 'Run once', conversationId: 'step-http-source' });
+    // The expected file inside the folder is placed; the one climbing out of it never is.
+    expect(saved!.expected).toEqual([{ path: 'out/report.txt', real: path.join(approved, 'out', 'report.txt') }, { path: '../private/passwords.txt' }]);
+    // Nothing ran: no file appeared.
+    await expect(fs.stat(path.join(approved, 'out'))).rejects.toThrow();
+
+    expect(prove('wfr_step_two')).toBe('stored');
+    const again = await sendAs('wfr_step_two', 'ask_user_to_run', { ...step, command: '  make release  ' });
+    expect(textOf(again)).toContain('already waiting');
+    expect(textOf(again)).toContain(id!);
+    expect(await readSessionUserRequests(session.id)).toHaveLength(1);
+  });
+
+  it('does not move the working folder to where an expected file is (CodeRabbit on #2049)', async () => {
+    setup();
+    await writeTree(approved, { 'elsewhere/keep.txt': 'x' });
+    const session = await createSession({ conversationId: 'step-http-workspace' });
+    const prove = proveFor(session.id, 'step-http-workspace');
+    expect(prove('wfr_ws_one')).toBe('stored');
+    expect(failed(await sendAs('wfr_ws_one', 'ask_user_to_run', { ...step, expected: ['/workspace/elsewhere/out.bin'] }))).toBe(false);
+    expect(prove('wfr_ws_two')).toBe('stored');
+    expect(failed(await sendAs('wfr_ws_two', 'ask_user_to_run', { ...step, command: 'make flash', expected: [] }))).toBe(false);
+    const saved = await readSessionUserRequests(session.id);
+    expect(saved[0]!.expected).toEqual([{ path: '/workspace/elsewhere/out.bin', real: path.join(approved, 'elsewhere', 'out.bin') }]);
+    // The next step without a folder still uses the approved folder, not the expected file's.
+    expect(saved[1]).toMatchObject({ command: 'make flash', folder: approved });
+  });
+
+  it('reports the person\'s answer and the expected files, never what is inside them', async () => {
+    setup();
+    const session = await createSession({ conversationId: 'step-http-status' });
+    const prove = proveFor(session.id, 'step-http-status');
+    expect(prove('wfr_status_ask')).toBe('stored');
+    const id = /ur_[a-z0-9]{12}/.exec(textOf(await sendAs('wfr_status_ask', 'ask_user_to_run', step)))![0];
+    expect(prove('wfr_status_open', 'user_request_status')).toBe('stored');
+    const open = textOf(await sendAs('wfr_status_open', 'user_request_status', { id }));
+    expect(open).toContain('OPEN');
+    expect(open).toContain('out/report.txt not found');
+    expect(open).toContain('../private/passwords.txt not checked');
+    expect(open).not.toContain('hunter2');
+
+    await writeTree(approved, { 'out/report.txt': 'secret result text' });
+    const { sessionControlsFor } = await import('../src/main/bridge.js');
+    const shown = (await sessionControlsFor(session.id)).userRequests?.[0];
+    expect(shown?.found[0]).toMatchObject({ path: 'out/report.txt', state: 'found', size: 18 });
+    expect(shown?.found[1]).toMatchObject({ state: 'unchecked' });
+
+    expect((await answerUserRequest(session.id, id, 'done'))?.changed).toBe(true);
+    // The first answer stands.
+    expect((await answerUserRequest(session.id, id, 'skipped'))?.changed).toBe(false);
+    expect(prove('wfr_status_done', 'user_request_status')).toBe('stored');
+    const done = textOf(await sendAs('wfr_status_done', 'user_request_status', { id }));
+    expect(done).toContain('DONE');
+    expect(done).not.toContain('secret result text');
+    expect(prove('wfr_status_unknown', 'user_request_status')).toBe('stored');
+    expect(failed(await sendAs('wfr_status_unknown', 'user_request_status', { id: 'ur_000000000000' }))).toBe(true);
+    await fs.rm(path.join(approved, 'out'), { recursive: true, force: true });
+  });
+
+  it('refuses a folder outside the approved ones, an overlong command, and a chat with recording off', async () => {
+    setup();
+    const session = await createSession({ conversationId: 'step-http-refusals' });
+    const prove = proveFor(session.id, 'step-http-refusals');
+    expect(prove('wfr_refuse_folder')).toBe('stored');
+    const outsideFolder = await sendAs('wfr_refuse_folder', 'ask_user_to_run', { ...step, workdir: outside });
+    expect(failed(outsideFolder)).toBe(true);
+    expect(textOf(outsideFolder)).toContain('No step was recorded');
+    expect(prove('wfr_refuse_long')).toBe('stored');
+    const long = await sendAs('wfr_refuse_long', 'ask_user_to_run', { ...step, command: 'x'.repeat(8 * 1024 + 1) });
+    expect(textOf(long)).toContain('longer than 8 KB');
+    ctx.sessionTools = false;
+    expect(prove('wfr_refuse_recording')).toBe('stored');
+    expect(textOf(await sendAs('wfr_refuse_recording', 'ask_user_to_run', step))).toContain('Session recording');
+    expect(await readSessionUserRequests(session.id)).toEqual([]);
+  });
+
+  it('is offered in Read-only mode over Run programs, since it runs nothing, and not without Run programs', async () => {
+    setup();
+    const session = await createSession({ conversationId: 'step-http-readonly' });
+    const prove = proveFor(session.id, 'step-http-readonly');
+    const configured = getConfig().capabilities.command;
+    try {
+      getConfig().capabilities.command = true;
+      ctx.readOnly = true;
+      ctx.caps = withCaps({});
+      expect(toolNames(await core('tools/list'))).toContain('ask_user_to_run');
+      expect(prove('wfr_readonly')).toBe('stored');
+      expect(failed(await sendAs('wfr_readonly', 'ask_user_to_run', step))).toBe(false);
+      getConfig().capabilities.command = false;
+      expect(prove('wfr_readonly_off')).toBe('stored');
+      expect(textOf(await sendAs('wfr_readonly_off', 'ask_user_to_run', { ...step, command: 'other' }))).toContain('Run programs');
+    } finally {
+      getConfig().capabilities.command = configured;
+    }
   });
 });
 

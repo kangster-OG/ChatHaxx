@@ -94,6 +94,18 @@ var CLF_DOM = (() => {
     for (const injected of clone.querySelectorAll(NOT_PROMPT)) injected.remove();
     return clone.textContent ?? '';
   };
+  /**
+   * The editor's text with its line breaks (#2074): each paragraph its own line, and a <br> a line
+   * break, which textContent drops. Only for comparisons that must see lines; composerText stays as is.
+   */
+  const editorLines = (node) => {
+    if (!node || node.matches?.(NOT_PROMPT) || typeof node.cloneNode !== 'function') return editorText(node);
+    const clone = node.cloneNode(true);
+    for (const injected of clone.querySelectorAll(NOT_PROMPT)) injected.remove();
+    for (const br of clone.querySelectorAll('br')) br.replaceWith('\n');
+    const blocks = [...clone.children].some(child => /^(P|DIV|LI|PRE|BLOCKQUOTE|H[1-6])$/.test(child.tagName));
+    return blocks ? [...clone.childNodes].map(child => child.textContent ?? '').join('\n') : clone.textContent ?? '';
+  };
   const authoredText = (node) => {
     if (!node?.querySelector?.(APP_MENTION_CHIP) || typeof node.cloneNode !== 'function') return text(node);
     const clone = node.cloneNode(true);
@@ -1977,11 +1989,52 @@ var CLF_DOM = (() => {
    * is reclaimed; anything a person added after it, an attachment, or a busy page keeps it.
    */
   function clearRevivalResidue() {
+    return clearOwnResidue(REVIVAL_RESIDUE);
+  }
+
+  /**
+   * How every Compact & Resume brief begins (src/main/session/handoff.ts resumeBootstrapText),
+   * compared without whitespace: its marker, then the fixed first sentence.
+   */
+  const RESUME_RESIDUE = /^\[\[CLF-RESUME:[A-Za-z0-9_-]{8,64}\]\]ContinuingaChatOnSteroidssessionthatwascompacted\./;
+
+  /**
+   * Empties a Project home editor that holds only an earlier Compact & Resume brief (#2068).
+   *
+   * Within one tab ChatGPT keeps the Project home's editor text after it was sent and the page moved
+   * to the new chat. The next Compact & Resume in that Project found the brief already there,
+   * waited for an empty editor and gave up ("could not open the source Project"), every time,
+   * until the person cleared or sent it by hand. Only a brief this page typed itself, unchanged, is
+   * taken (a page reloaded since has none of its own); an attachment or a busy page keeps it.
+   */
+  function clearResumeResidue() {
+    // Only a brief this page typed itself, word for word: one a person added to stays (CodeRabbit on #2069).
+    return clearOwnResidue(RESUME_RESIDUE, text => typedBriefs.includes(text));
+  }
+
+  /** The Compact & Resume briefs this page typed, compacted as residue is compared; the newest few. */
+  const typedBriefs = [];
+  function rememberTypedBrief(value) {
+    const text = compactDraft(value);
+    if (!RESUME_RESIDUE.test(text) || typedBriefs.includes(text)) return;
+    typedBriefs.push(text);
+    if (typedBriefs.length > 4) typedBriefs.shift();
+  }
+
+  /**
+   * Editor text as residue is compared: without the escapes ChatGPT adds to stored text (a hard
+   * line break's backslash too, CodeRabbit on #2069) and without whitespace.
+   */
+  function compactDraft(value) {
+    return String(value).replace(/\\(?=\r?\n)/g, '').replace(/\\(?=[!-/:-@[-`{-~])/g, '').replace(/\s+/g, '');
+  }
+
+  function clearOwnResidue(pattern, owned = () => true) {
     return safe(() => {
       const box = composer();
       if (!composerWritable() || generating() || stopButton() || hasComposerAttachments()) return false;
-      const text = String(editorText(box)).replace(/\\(?=[!-/:-@[-`{-~])/g, '').replace(/\s+/g, '');
-      if (!text || !REVIVAL_RESIDUE.test(text)) return false;
+      const text = compactDraft(editorText(box));
+      if (!text || !pattern.test(text) || !owned(text)) return false;
       box.focus();
       const selection = document.getSelection();
       if (!selection || document.activeElement !== box) return false;
@@ -2420,7 +2473,9 @@ var CLF_DOM = (() => {
    * not a reason to hold a finished Goal reply at "sending" (2026-09-03: one letter did).
    */
   function insertPrompt(value, mode = false, failure = () => undefined) {
-    return insertIntoEditor(composer(), value, mode, failure, box => composer() === box);
+    const inserted = insertIntoEditor(composer(), value, mode, failure, box => composer() === box);
+    if (inserted) safe(() => rememberTypedBrief(value), undefined);
+    return inserted;
   }
 
   /**
@@ -2890,13 +2945,16 @@ var CLF_DOM = (() => {
   }
 
   /** Observed ChatGPT Plugins settings surface. Missing/ambiguous structure is not proof. */
-  async function pluginRefreshView(connectorName, expectedTools = [], expectedAppId = null) {
+  async function pluginRefreshView(connectorName, expectedTools = [], expectedAppId = null, expectedSurface = null) {
     // A durable exact-ID request already identifies its connector even when names collide.
     // Use that ID's proven surface for limits too, rather than borrowing another surface's name.
     const identified = expectedAppId ? ownApps.filter(app => app.appId === expectedAppId) : [];
     const proven = identified.length ? identified : provenAppsFor(connectorName);
-    if (proven === null && !expectedAppId) return null;
-    const externalPlugins = proven?.length ? proven.every(app => app.surface === 'plugins') : pluginsConnectorName(connectorName);
+    const surfaceAt = ['core', 'desktop', 'plugins'].indexOf(expectedSurface);
+    const nativeRoute = !location.hash && /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname);
+    const nativeInspection = surfaceAt >= 0 && !!nativeRoute &&
+      (expectedAppId !== null || connectorNames()[surfaceAt] === connectorName);
+    if (proven === null && !expectedAppId && !nativeInspection) return null;
     const snapshot = await new Promise(resolve => {
       const nonce = crypto.randomUUID();
       const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
@@ -2905,11 +2963,20 @@ var CLF_DOM = (() => {
         if (event.source === window && event.origin === location.origin && data?.source === 'clf-plugin-reply' && data.nonce === nonce && data.v === 1) finish(data.plugin);
       };
       const timer = setTimeout(() => finish(null), 1500);
-      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames(), appIds: connectorApps() }, location.origin);
+      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames(), appIds: connectorApps(),
+        refresh: nativeInspection ? { appId: expectedAppId ?? nativeRoute[1], surface: expectedSurface } : null }, location.origin);
     });
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash) ||
       (!location.hash ? /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname) : null);
-    if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : !ownSnapshot(snapshot, connectorName)) ||
+    // The helper may inspect the native tunnel even when older call-derived aliases collide.
+    // This only reads a card: main verifies this tunnel against the requested surface before
+    // granting Current/Claim. Never substitute these aliases for that stronger proof.
+    const tunnelInspection = nativeInspection && /^tunnel_[a-zA-Z0-9]{8,80}$/.test(snapshot?.tunnelId || '') &&
+      (expectedAppId ? snapshot?.appId === expectedAppId : snapshot?.connectorName === connectorName);
+    const conflictingNativeIdentity = nativeInspection && ownApps.some(app => app.appId === snapshot?.appId && app.surface !== expectedSurface);
+    const externalPlugins = tunnelInspection ? expectedSurface === 'plugins'
+      : proven?.length ? proven.every(app => app.surface === 'plugins') : pluginsConnectorName(connectorName);
+    if (!snapshot || snapshot.appId !== route?.[1] || (!tunnelInspection && (conflictingNativeIdentity || (expectedAppId ? snapshot.appId !== expectedAppId : !ownSnapshot(snapshot, connectorName)))) ||
         !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 64) || JSON.stringify(snapshot.tools).length > 300000 ||
         snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !(externalPlugins ? /^[a-z0-9_.-]{1,64}$/i : /^[a-z][a-z0-9_]{0,79}$/).test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
         new Set(snapshot.tools.map(tool => tool.name)).size !== snapshot.tools.length) return null;
@@ -2931,13 +2998,20 @@ var CLF_DOM = (() => {
     return target !== null && (target ? snapshot.appId === target : proven.length
       ? proven.some(app => app.appId === snapshot.appId) : snapshot.connectorName === connectorName);
   }
-  function pluginInstalledButtons(connectorName, expectedAppId = null, expectedSurface = null) {
+  function pluginInstalledButtons(connectorName, expectedAppId = null, expectedSurface = null, inspectTunnel = false) {
     // Native links name their exact App Id, even when a fresh provider rename has not reached
     // the learned name yet. Legacy buttons still need names; the destination proves identity.
     // A scoped enrolled observation keeps its App Id; other proven aliases cannot replace it.
     if (expectedAppId !== null && (typeof expectedAppId !== 'string' || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(expectedAppId))) return null;
     let proven = provenAppsFor(connectorName);
-    if (expectedAppId !== null && expectedSurface !== null) {
+    const nativeInspection = inspectTunnel && ['core', 'desktop', 'plugins'].includes(expectedSurface) &&
+      location.pathname === '/settings/plugins-settings' && !location.hash &&
+      (expectedAppId !== null || connectorNames()[['core', 'desktop', 'plugins'].indexOf(expectedSurface)] === connectorName);
+    // Keep unambiguous proven-ID discovery through a provider rename. When aliases collide,
+    // inspect only the configured-name row or durable exact ID instead. The destination's
+    // tunnel still needs main's validation; none of these navigation choices grants Refresh.
+    if (nativeInspection && (expectedAppId !== null || proven === null || firstEnrollmentAppId(proven, connectorName) === null)) proven = [];
+    if (!nativeInspection && expectedAppId !== null && expectedSurface !== null) {
       const surfaceAt = ['core', 'desktop', 'plugins'].indexOf(expectedSurface);
       if (surfaceAt < 0) return null;
       const identified = ownApps.filter(app => app.appId === expectedAppId);
@@ -2962,18 +3036,35 @@ var CLF_DOM = (() => {
       // The newer shell lists installed plugins on the /settings/plugins-settings page itself.
       if (location.pathname === '/settings/plugins-settings' && !location.hash) {
         const main = document.querySelector('main');
-        if (!main || (!proven.length && !connectorNames().includes(connectorName))) return null;
+        if (!main || (!nativeInspection && !proven.length && !connectorNames().includes(connectorName))) return null;
         // Measured 2026-10-11: installed rows became links to exact management pages.
         // Catalog and external links cannot identify an installed connector.
-        const rows = [...main.querySelectorAll('button,a[href]')].filter(button => {
-          if (!button.isConnected || button.disabled || button.getClientRects().length === 0 || button.closest(`${OWN_SURFACES}, ${TURN}`) || !composerCssVisible(button)) return false;
+        const installed = [...main.querySelectorAll('button,a[href]')].filter(button => button.isConnected && !button.closest(`${OWN_SURFACES}, ${TURN}`));
+        const visible = installed.filter(button => !button.disabled && button.getClientRects().length > 0 && composerCssVisible(button));
+        const installedId = button => {
+          if (button.tagName !== 'A') return null;
+          const url = new URL(button.href, location.href);
+          return url.origin === location.origin && !url.hash
+            ? /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname)?.[1] ?? null : null;
+        };
+        if (nativeInspection) {
+          const ids = expectedAppId !== null ? [expectedAppId] : namedTargetId !== undefined ? [namedTargetId] : proven.map(app => app.appId);
+          const exact = visible.filter(button => ids.includes(installedId(button)));
+          if (exact.length || expectedAppId !== null) return exact.length ? exact : null;
+          if (installed.some(button => ids.includes(installedId(button)))) return [];
+          // A recreated connector has a new ID: only an unbound native inspection may
+          // try its configured-name row when none of the proven IDs is still installed.
+          const configured = installed.filter(button => (button.tagName !== 'A' || installedId(button)) &&
+            [...button.querySelectorAll('*')].some(node => !node.children.length && text(node) === connectorName));
+          const visibleConfigured = configured.filter(button => visible.includes(button));
+          return !configured.length ? null : configured.length === visibleConfigured.length ? visibleConfigured : [];
+        }
+        const rows = visible.filter(button => {
           if (button.tagName === 'A') {
-            const url = new URL(button.href, location.href);
-            const route = /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname);
-            if (url.origin !== location.origin || !route || url.hash) return false;
-            if (expectedAppId !== null && route[1] !== expectedAppId) return false;
-            if (namedTargetId !== undefined) return route[1] === namedTargetId;
-            if (proven.length) return proven.some(app => app.appId === route[1]);
+            const appId = installedId(button);
+            if (!appId || (expectedAppId !== null && appId !== expectedAppId)) return false;
+            if (namedTargetId !== undefined) return appId === namedTargetId;
+            if (proven.length) return proven.some(app => app.appId === appId);
             if (expectedAppId !== null) return true;
           }
           if (expectedAppId !== null || namedTargetId !== undefined) return false; // Once an exact ID is known, name-only buttons cannot prove its identity.
@@ -3607,7 +3698,7 @@ var CLF_DOM = (() => {
       new URL(link.href, location.href).origin === location.origin &&
       projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
     return new Promise(resolve => {
-      let clicked = false, done = false, lastObservation = 'source-not-ready';
+      let clicked = false, done = false, lastObservation = 'source-not-ready', residueCleared = false;
       // Where the source chat was when the link was clicked, and how many times its own route
       // rewrite has since taken that click away.
       let clickedPath = '', reclicks = 0;
@@ -3629,6 +3720,8 @@ var CLF_DOM = (() => {
         // Turns of the earlier pages ChatGPT keeps mounted, undisplayed, are not on this page.
         if (clicked && projectHomeId() === entry.id) {
           if (!composer()?.isConnected || !composerSubmitReady()) {
+            // An earlier brief of the app's own that ChatGPT kept in this Project home (#2068).
+            if (!residueCleared && clearResumeResidue()) { residueCleared = true; return check(); }
             lastObservation = 'composer-not-ready';
             return;
           }
@@ -3851,6 +3944,7 @@ var CLF_DOM = (() => {
     composerAuthoredText,
     /** The composer's prompt text, without nodes ChatGPT injects for presentation (#1792). */
     composerText: (box = composer()) => editorText(box),
+    composerLines: (box = composer()) => editorLines(box),
     pageChecks,
     userPromptText,
     userMessageReaction,
@@ -3957,6 +4051,7 @@ var CLF_DOM = (() => {
     composer,
     composerSubmitReady,
     clearRevivalResidue,
+    clearResumeResidue,
     composerWritable,
     composerBox,
     pageTheme,
