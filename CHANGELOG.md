@@ -9,6 +9,31 @@ The app and the browser extension in `extension/` are versioned together. **Relo
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.52] — A list of your scheduled messages, and search through whole long chats
+You can now see every scheduled message of your chats in one list, and chat search finds words anywhere in very long chats. Compact & Resume in a Project survives a page reload, and Skills are no longer chosen when you say not to use them.
+
+### 👉 After updating
+
+- Nothing to do. The browser extension updates itself.
+- The first chat searches after updating rebuild each chat's search index once, in the background. Results fill in as it goes.
+
+### ✨ New
+
+- **Scheduled.** A new page in the sidebar lists the scheduled messages of all your chats, with when each runs next, how often, and its text. From there you can pause or resume a schedule, run it now, delete it, or open its chat.
+- **Search covers the whole history of long chats.** It used to stop after the first million characters of a chat; now every message is searched, however long the chat is, and big chats are read in small pieces so the app stays light.
+
+### 💪 Better
+
+- **Compact & Resume in a Project after a reload.** If the page reloaded while it ran, it could fail every time afterwards. The app now clears its own leftover brief and goes on.
+- **Search retries after a temporary error.** A chat whose search index could not be saved is tried again (at most every 30 seconds) instead of staying out of search until the chat changes.
+- **Skills are not chosen when you say not to use them**, and a Skill's name is recognised in Japanese when a particle follows it, as in `code-reviewを使って`.
+- **Copied tables keep their own rows** when an answer has several tables with the same column headings.
+- **Clearer logs.** A failed schedule action and every decision about a scheduled message (moved, released, timed out) now say which and why, and a Stop that no page took no longer reads as a contradiction.
+
+### 🛠 Fixed
+
+- A very long chat title or message on the Scheduled page wraps inside its card instead of pushing the page sideways.
+
 ## [2.1.51] — Steps for you, a limit on busy chats, and Telegram
 ChatGPT can now hand you a step it cannot do itself, you can limit how many chats work at once, and you can get your chat notifications in Telegram. Chats that get stuck after a Stop or a reload now end up where you expect, and the browser extension and ChatGPT's page share the app's look.
 
@@ -1873,7 +1898,7 @@ Windows/macOS/Linux build matrix can be published under a fresh tag instead of t
 This is the post-2.0 hardening pass. It is unusually broad because it combines the reusable-worker
 rewrite, a live transcript/Goal investigation, session-store recovery work, the first Computer Use
 overhaul tranche, and an adversarial restart/race audit. The detailed engineering log is in
-`docs/bughunt-2026-08-25.md`.
+`docs/archive/bughunt-2026-08-25.md`.
 
 ### Added
 - **Workers are reusable ChatGPT conversations.** A worker that finishes normally now sleeps,
@@ -2093,7 +2118,7 @@ against the removed internals, or against the old pass-through behaviour, will n
   wrapper, and two dead MCP formatting exports.
 
 ### Fixed
-Full write-up, defect by defect, in `docs/bughunt-follow-up-2026-08-24.md`. Credible leads that
+Full write-up, defect by defect, in `docs/archive/bughunt-follow-up-2026-08-24.md`. Credible leads that
 were reviewed but not reproducible enough to fix are tracked privately rather than published, as
 `SECURITY.md` and the documentation rule in `AGENTS.md` require.
 
@@ -2198,8 +2223,8 @@ were reviewed but not reproducible enough to fix are tracked privately rather th
   worth spending a token on is asking it to think before it starts.
 
 ### Fixed
-Full write-up, with what each defect actually did, in `docs/bug-audit-2026-08-23.md` and
-`docs/bug-audit-2026-08-24.md` — the second pass audited the merged tree for ordering at the
+Full write-up, with what each defect actually did, in `docs/archive/bug-audit-2026-08-23.md` and
+`docs/archive/bug-audit-2026-08-24.md` — the second pass audited the merged tree for ordering at the
 crash, reload and navigation boundaries, where several of these were correct a second later and
 wrong at the moment a caller decides whether its operation happened.
 
